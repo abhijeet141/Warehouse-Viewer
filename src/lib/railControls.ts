@@ -268,8 +268,14 @@ export class RailControls {
     const dy = e.clientY - this.lastY;
     this.lastX = e.clientX;
     this.lastY = e.clientY;
-    this.yaw -= dx * this.opts.dragLookSpeed;
-    this.pitch -= dy * this.opts.dragLookSpeed;
+    // Grab-the-world drag, matching OrbitControls in the overview mode: dragging
+    // moves the scene WITH the cursor (drag right -> scene swings right, drag
+    // down -> scene tilts down), the same convention as Google Street View.
+    // The previous FPS-style look (yaw -= dx) turned the opposite way from the
+    // orbit view, so the drag direction flipped the moment you entered the
+    // walkthrough — the contradictory behaviour reported on the exhibition demo.
+    this.yaw += dx * this.opts.dragLookSpeed;
+    this.pitch += dy * this.opts.dragLookSpeed;
     this.pitch = clamp(this.pitch, this.opts.minPitch, this.opts.maxPitch);
   }
 
@@ -279,9 +285,11 @@ export class RailControls {
   }
 
   private onWheel(e: WheelEvent) {
+    // Swallow the wheel event so the browser doesn't scroll/zoom the page, but
+    // don't glide along the aisle — scroll is intentionally inert inside a walk.
     e.preventDefault();
-    const a = this.aisles[this.index];
-    this.dist = clamp(this.dist + Math.sign(e.deltaY) * this.opts.wheelSpeed, 0, a.length);
+    // const a = this.aisles[this.index];
+    // this.dist = clamp(this.dist + Math.sign(e.deltaY) * this.opts.wheelSpeed, 0, a.length);
   }
 
   // Call once per frame from the render loop.

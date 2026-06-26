@@ -341,13 +341,25 @@
       seg.coordinateY + seg.dimensionY / 2,
     );
 
+    // Overview: keep the highlight see-through (depthTest off) so a hovered
+    // space stays visible through the front racks. Walkthrough: the camera is
+    // inside the aisle, where a see-through box paints the whole red volume over
+    // the rack frame in front of it and spills into the walkway ("displays out").
+    // There, depth-test it so the structure ahead occludes it and it reads as
+    // sitting in its slot; the polygon offset keeps the front face from
+    // z-fighting the coplanar rack front.
+    const seeThrough = mode !== 'walk';
+
     if (!outlineOnly) {
       const mat = new THREE.MeshStandardMaterial({
         color: SPACE_HOVER_COLOR,
         transparent: true,
         opacity: SPACE_HOVER_OPACITY,
         depthWrite: false,
-        depthTest: false, // show through the opaque rack structure
+        depthTest: !seeThrough,
+        polygonOffset: !seeThrough,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
       });
       const mesh = new THREE.Mesh(geom, mat);
       mesh.position.copy(center);
@@ -357,7 +369,11 @@
     }
 
     const edgeGeom = new THREE.EdgesGeometry(geom);
-    const edgeMat = new THREE.LineBasicMaterial({ color: SPACE_HOVER_COLOR, transparent: true, depthTest: false });
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: SPACE_HOVER_COLOR, transparent: true,
+      depthTest: !seeThrough,
+      polygonOffset: !seeThrough, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+    });
     const edges = new THREE.LineSegments(edgeGeom, edgeMat);
     edges.position.copy(center);
     // Outline-only sits on top of the find box (scale 1.02), so push it out
@@ -906,6 +922,7 @@
   function exitWalk() {
     aislePickerOpen = false;
     mode = 'orbit';
+    clearHighlight(); // drop the walk-style (depth-tested) highlight so it rebuilds for orbit
     rail.disable();
     if (arrowGroup) arrowGroup.visible = true;
     setRackOpacity(false);
@@ -1287,7 +1304,7 @@
     {/if}
   </div>
   {#if mode === 'walk'}
-    <div class="walk-hint">drag to look · W/S move · A/D turn · Q/E up·down · ←/→ aisle · scroll glide · Esc exit</div>
+    <div class="walk-hint">drag to look · W/S move · A/D turn · Q/E up·down · ←/→ aisle · Esc exit</div>
   {:else}
     <div class="walk-hint">drag to orbit · scroll to zoom · ↑/↓ move · ←/→ strafe</div>
   {/if}
