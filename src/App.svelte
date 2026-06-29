@@ -325,14 +325,17 @@
 <style>
   main {
     --nav-h: 58px;
+    /* The toolbar is rendered at this scale (≈ an 82% browser-zoom look) so its
+       height and controls read more compactly at 100% zoom. */
+    --nav-scale: 0.82;
     position: relative;
     display: flex;
     flex-direction: column;
     height: 100%;
     background: #dde3ea;
     /* The header overlays this reserved strip; collapsing animates it to 0 so the
-       3D viewport grows to fill. */
-    padding-top: var(--nav-h);
+       3D viewport grows to fill. Reserve the scaled header height, not the raw one. */
+    padding-top: calc(var(--nav-h) * var(--nav-scale));
     transition: padding-top 0.38s cubic-bezier(0.4, 0, 0.2, 1);
   }
   main.nav-collapsed { padding-top: 0; }
@@ -341,8 +344,11 @@
     position: absolute;
     top: 0;
     left: 0;
-    right: 0;
+    /* Pre-inflate the width so that after the scale-down it spans edge to edge. */
+    width: calc(100% / var(--nav-scale));
     height: var(--nav-h);
+    transform: scale(var(--nav-scale));
+    transform-origin: top left;
     box-sizing: border-box;
     z-index: 30;
     background: #f4f6f8;
@@ -355,7 +361,7 @@
     transition: transform 0.38s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.24s ease;
   }
   header.collapsed {
-    transform: translateY(-100%);
+    transform: scale(var(--nav-scale)) translateY(-100%);
     opacity: 0;
     pointer-events: none;
   }

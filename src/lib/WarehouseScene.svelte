@@ -1712,6 +1712,8 @@
     left: 14px;
     z-index: 10;
     pointer-events: none;
+    transform: scale(0.82);
+    transform-origin: top left;
     min-width: 78px;
     padding: 10px 14px 11px;
     text-align: center;
@@ -1778,6 +1780,8 @@
     position: absolute;
     z-index: 10;
     pointer-events: none;
+    transform: scale(0.82);
+    transform-origin: top left;
     min-width: 156px;
     padding: 13px 18px 14px;
     text-align: center;
@@ -1797,7 +1801,8 @@
     position: absolute;
     left: 50%;
     bottom: 64px;
-    transform: translateX(-50%);
+    transform: translateX(-50%) scale(0.82);
+    transform-origin: bottom center;
     z-index: 11;
     pointer-events: none;
     width: min(720px, calc(100% - 40px));
@@ -1947,6 +1952,8 @@
   .loc-unit { margin-left: 5px; color: #64748b; }
   .nav-ui {
     position: absolute; top: 14px; right: 14px; z-index: 10;
+    transform: scale(0.82);
+    transform-origin: top right;
     display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
   }
   .chev { width: 13px; height: 13px; color: #64748b; flex: none; transition: transform 0.15s; }
