@@ -8,8 +8,9 @@
   import { TourController } from './tourController';
   import { buildRacks, buildAisleSigns, buildPallets, buildSafetyNets, groupBaysIntoRows } from './rackBuilder';
   import { buildEnvironment, type ShellBounds } from './environmentBuilder';
-  import { buildGoods } from './goodsBuilder';
+  import { buildGoods, isDemoOccupied } from './goodsBuilder';
   import { disposeGoodsTextures } from './goodsTextures';
+  import { generatePodData, renderPodLabel, type PodData } from './podLabel';
   import type { Segment, SegmentType } from '../types';
 
   export let segments: Segment[];
@@ -163,6 +164,9 @@
   let realisticDisposers: Array<() => void> = [];
   let goodsHandle: { group: THREE.Group; dispose: () => void } | null = null;
   let goodsEnv: THREE.Texture | null = null; // PMREM env map for realistic goods reflections
+  // Pod-label preview: clicking an occupied demo pallet renders its ZPL label.
+  // `loading` while Labelary renders; then `url` (a PNG object URL) or `error`.
+  let podLabel: { name: string; data: PodData; loading: boolean; url: string | null; error: boolean } | null = null;
   let shellBounds: ShellBounds | null = null;
   // Building shell (controlled from the App header). When off, the roof deck,
   // walls, steel columns/rafters and hanging lights all hide together and the
@@ -585,7 +589,8 @@
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
     if (e.key === 'Escape') {
-      if (aislePickerOpen) aislePickerOpen = false;
+      if (podLabel) closePodLabel(); // close the pod label first
+      else if (aislePickerOpen) aislePickerOpen = false;
       else if (mode === 'walk') exitOneLevel(); // tour → walkway → overview, one step
     } else if (e.code === 'Space' && mode === 'walk' && tourActive) {
       toggleTourPause(); // spacebar = hold / continue the tour (handy for a live demo)
@@ -774,8 +779,15 @@
     const hits = raycaster.intersectObject(spaceInst, false);
     if (hits.length > 0 && hits[0].instanceId !== undefined) {
       applyHighlight(hits[0].instanceId);
+      // Hint that an occupied pallet is clickable (opens its pod label). Overview
+      // only — in walk mode the rail owns the cursor (grab/grabbing).
+      if (mode === 'orbit') {
+        const seg = spaceSegments[hits[0].instanceId];
+        canvas.style.cursor = showStock && seg && isDemoOccupied(seg.fullName) ? 'pointer' : '';
+      }
     } else {
       clearHighlight();
+      if (mode === 'orbit' && canvas.style.cursor === 'pointer') canvas.style.cursor = '';
     }
   }
 
@@ -846,10 +858,13 @@
     pointerDownY = e.clientY;
   }
 
-  // A click (not a drag) on an aisle arrow walks that aisle.
+  // Click handling on the canvas: drags are ignored. With demo stock on, a click
+  // on an occupied pallet opens its pod label (works in overview AND walk). In
+  // overview, a click on an aisle arrow walks that aisle.
   function onCanvasClick(e: MouseEvent) {
+    if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) return; // a drag, not a click
+    if (showStock && tryOpenPodLabel(e)) return;
     if (mode !== 'orbit' || arrowMeshes.length === 0) return;
-    if (Math.hypot(e.clientX - pointerDownX, e.clientY - pointerDownY) > 6) return;
     const rect = canvas.getBoundingClientRect();
     pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -859,6 +874,45 @@
     const name = (hits[0].object as THREE.Mesh).userData.aisleName as string;
     const idx = rail.aisleNames.indexOf(name);
     if (idx >= 0) { setArrowHover(null); enterWalk(idx); }
+  }
+
+  // Raycast the SPACE bins under the click; if the hit location holds a demo
+  // pallet, open its pod label. Returns true when a label was opened (so the
+  // click is consumed and doesn't also trigger aisle-arrow navigation).
+  function tryOpenPodLabel(e: MouseEvent): boolean {
+    const spaceInst = tierInstancedMeshes.get('SPACE');
+    if (!spaceInst) return false;
+    const rect = canvas.getBoundingClientRect();
+    pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pointer, perspectiveCamera);
+    const hits = raycaster.intersectObject(spaceInst, false);
+    if (!hits.length || hits[0].instanceId === undefined) return false;
+    const seg = spaceSegments[hits[0].instanceId];
+    if (!seg || !isDemoOccupied(seg.fullName)) return false;
+    openPodLabel(seg.fullName);
+    return true;
+  }
+
+  // Generate the pod details, show the panel in its loading state, then render
+  // the ZPL to a PNG (Labelary). Guarded so a stale render (the user clicked
+  // another pallet, or closed the panel) can't overwrite the current one.
+  async function openPodLabel(name: string) {
+    if (podLabel?.url) URL.revokeObjectURL(podLabel.url);
+    const data = generatePodData(name);
+    podLabel = { name, data, loading: true, url: null, error: false };
+    try {
+      const url = await renderPodLabel(data);
+      if (podLabel && podLabel.name === name) podLabel = { ...podLabel, loading: false, url };
+      else URL.revokeObjectURL(url); // superseded while rendering — discard
+    } catch {
+      if (podLabel && podLabel.name === name) podLabel = { ...podLabel, loading: false, error: true };
+    }
+  }
+
+  function closePodLabel() {
+    if (podLabel?.url) URL.revokeObjectURL(podLabel.url);
+    podLabel = null;
   }
 
   // Re-raycast each frame while walking: the camera moves without pointer
@@ -1203,6 +1257,8 @@
 
   $: if (scene && visibleTypes) applyVisibility();
   $: if (scene && worldGroup) { showStock; applyStock(); }
+  // Turning demo stock off closes any open pod label (its pallet is now hidden).
+  $: if (!showStock && podLabel) closePodLabel();
 
   // Rail aisle centrelines / eye height match the depth-stretched world so
   // walk mode stays aligned with the racks.
@@ -1507,6 +1563,7 @@
     if (highlightGroup) disposeHighlightGroup(highlightGroup);
     for (const g of fadingHighlights) disposeHighlightGroup(g);
     if (goodsHandle) goodsHandle.dispose();
+    if (podLabel?.url) URL.revokeObjectURL(podLabel.url);
     disposeGoodsTextures();
     goodsEnv?.dispose();
     if (controls) controls.dispose();
@@ -1516,6 +1573,34 @@
 
 <div class="scene-container" bind:this={container}>
   <canvas bind:this={canvas} on:pointerdown={onCanvasPointerDown} on:click={onCanvasClick}></canvas>
+
+  {#if podLabel}
+    <!-- Pod label preview for the clicked demo pallet. Backdrop click / ✕ / Esc closes. -->
+    <div class="pod-overlay" on:click|self={closePodLabel} on:keydown={() => {}} role="presentation" transition:fade={{ duration: 140 }}>
+      <div class="pod-card" transition:scale={{ duration: 180, start: 0.94 }}>
+        <div class="pod-head">
+          <div class="pod-titles">
+            <span class="pod-label">Pod Label</span>
+            <span class="pod-loc">{podLabel.name}</span>
+          </div>
+          <button class="pod-close" on:click={closePodLabel} title="Close (Esc)" aria-label="Close">✕</button>
+        </div>
+        <div class="pod-body">
+          {#if podLabel.loading}
+            <div class="pod-state"><span class="pod-spinner" aria-hidden="true"></span>Rendering label…</div>
+          {:else if podLabel.error}
+            <div class="pod-state pod-err">
+              Couldn’t render the label (Labelary unreachable).
+              <button class="pod-retry" on:click={() => podLabel && openPodLabel(podLabel.name)}>Retry</button>
+            </div>
+          {:else if podLabel.url}
+            <img class="pod-img" src={podLabel.url} alt="Pod label for {podLabel.name}" />
+          {/if}
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if hoverInfo}
     <div
       class="loc-banner"
@@ -1794,6 +1879,83 @@
     border-radius: 14px;
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
   }
+
+  /* Pod label preview: centred modal over a dimmed backdrop, showing the ZPL
+     rendered to an image plus the key pod fields. */
+  .pod-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(2, 6, 23, 0.62);
+    backdrop-filter: blur(3px);
+    -webkit-backdrop-filter: blur(3px);
+  }
+  .pod-card {
+    display: flex;
+    flex-direction: column;
+    max-height: 100%;
+    width: min(360px, 90vw);
+    color: #e2e8f0;
+    background: rgba(11, 18, 32, 0.96);
+    border: 1.5px solid #334155;
+    border-radius: 16px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    overflow: hidden;
+  }
+  .pod-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+  }
+  .pod-titles { display: flex; flex-direction: column; gap: 2px; }
+  .pod-label {
+    font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: #7dd3fc; font-weight: 700;
+  }
+  .pod-loc {
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    font-size: 18px; font-weight: 700; color: #f1f5f9;
+  }
+  .pod-close {
+    flex: none; width: 28px; height: 28px; border-radius: 8px; cursor: pointer;
+    color: #cbd5e1; background: rgba(148, 163, 184, 0.12);
+    border: 1px solid rgba(148, 163, 184, 0.2); font-size: 13px; line-height: 1;
+    transition: background 0.15s, color 0.15s;
+  }
+  .pod-close:hover { background: rgba(239, 68, 68, 0.2); color: #fecaca; }
+  .pod-body {
+    display: flex; align-items: center; justify-content: center;
+    padding: 16px; min-height: 200px; overflow: auto;
+    background: rgba(148, 163, 184, 0.05);
+  }
+  .pod-img {
+    max-width: 100%; height: auto; border-radius: 6px;
+    background: #fff; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+  }
+  .pod-state {
+    display: flex; align-items: center; gap: 10px;
+    font-size: 13px; color: #94a3b8;
+  }
+  .pod-state.pod-err { flex-direction: column; color: #fca5a5; text-align: center; }
+  .pod-spinner {
+    width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid rgba(148, 163, 184, 0.3); border-top-color: #7dd3fc;
+    animation: pod-spin 0.7s linear infinite;
+  }
+  @keyframes pod-spin { to { transform: rotate(360deg); } }
+  .pod-retry {
+    cursor: pointer; padding: 5px 14px; border-radius: 8px; font-size: 12px;
+    color: #e2e8f0; background: rgba(56, 189, 248, 0.15);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+  }
+  .pod-retry:hover { background: rgba(56, 189, 248, 0.25); }
 
   /* Tour level showcase: floating panel detailing the inspected shelf — a
      summary header, level-summary stat strip, and a per-location table. */
