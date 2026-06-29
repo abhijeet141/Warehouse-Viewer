@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Segment } from '../types';
 import { seededRng } from './rng';
+import { renderBrandedLabel } from './podLabel';
 import {
   cardboardTexture, cardboardNormal,
   cartonTexture, cartonNormal,
@@ -17,6 +18,16 @@ import {
 
 const OCCUPANCY = 0.6;
 const PALLET_H = 144;          // mm, canonical pallet height
+
+// Whether a SPACE holds a demo pallet, in the seeded (occupied=null) demo fill.
+// This MUST mirror the occupancy test in decide() — it's the FIRST draw of the
+// per-name PRNG (`r() < OCCUPANCY`) — so callers outside the builder (e.g. the
+// click-to-print handler) can ask "is there a pallet here?" and get the same
+// answer the builder used when it placed the goods. Only meaningful in demo
+// mode; with a real `occupied` set, query that set instead.
+export function isDemoOccupied(fullName: string): boolean {
+  return seededRng(fullName)() < OCCUPANCY;
+}
 const HEADROOM = 250;          // mm, clearance kept under the level above
 
 // ---- canonical pallet: 1200 (X) x 144 (Y) x 1000 (Z) --------------------
@@ -213,6 +224,43 @@ export function buildGoods(
     return m;
   });
 
+  // FloWMS label on the aisle-facing front of each load. ONE plane geometry +
+  // ONE material/texture shared across all pods (the branded label is identical
+  // everywhere), so this is a single extra draw call no matter how many pods —
+  // the per-pod data lives in the click-to-open popup, not on the box. The
+  // texture is rendered once (async) below and dropped in when ready.
+  const LABEL_ASPECT = 2.5 / 1.5; // branded label width:height
+  const labelGeom = new THREE.PlaneGeometry(1, 1); // unit quad, scaled per instance
+  const labelMat = new THREE.MeshBasicMaterial({
+    side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1, // sit cleanly over the box face
+  });
+  const labelMesh = new THREE.InstancedMesh(labelGeom, labelMat, decisions.length);
+  labelMesh.frustumCulled = false;
+  labelMesh.raycast = () => {}; // clicks fall through to the SPACE bin → detail popup
+  labelMesh.name = 'GOODS_LABELS';
+  labelMesh.visible = false; // shown once the shared texture has loaded
+
+  // Aisles (run along X in this layout) → each pod faces ±Z toward its aisle's
+  // centreline, so the label reads to someone walking the aisle. Pick the nearest
+  // aisle's centre Z and face toward it.
+  const aisleLines = segments
+    .filter((s) => s.type === 'AISLE')
+    .map((s) => ({
+      x0: s.coordinateX, x1: s.coordinateX + s.dimensionX,
+      cz: s.coordinateY + s.dimensionY / 2,
+    }));
+  const faceDirZ = (px: number, pz: number): number => {
+    let best = 0, bestD = Infinity;
+    for (const a of aisleLines) {
+      const cxc = Math.max(a.x0, Math.min(a.x1, px));
+      const d = (px - cxc) ** 2 + (pz - a.cz) ** 2;
+      if (d < bestD) { bestD = d; best = a.cz; }
+    }
+    return aisleLines.length === 0 || best - pz >= 0 ? 1 : -1;
+  };
+  const labelQuat = new THREE.Quaternion();
+
   // Pass 2 — place instances.
   // The parent worldGroup carries a non-uniform scale (depth Z widened by hScale).
   // Composing an instance in local space would leave that scale to SHEAR every
@@ -295,15 +343,63 @@ export function buildGoods(
       color.setRGB(k, k * (0.97 + d.hue * 0.03), k * (0.92 + d.hue * 0.04));
     }
     mesh.setColorAt(idx, color);
+
+    // FloWMS label, stuck flat on the load's aisle-facing front face. Kept small
+    // and well WITHIN the box face (both width and height), and dropped to the
+    // lower-front of the stack — where the load is always solid — so it never
+    // overhangs the edges into a gap and looks unbacked. Shares the box's slight
+    // yaw jitter so it stays coplanar, reading as a real label on the pod.
+    const dirZ = faceDirZ(cx, cz);
+    const boxW = palletW * 1.04;                // box stack's X size
+    const boxDepth = palletD * 1.04;            // box stack's Z size
+    let lw = Math.min(footW * 0.55, boxW * 0.7); // smaller, and never wider than the face
+    let lh = lw / LABEL_ASPECT;
+    if (lh > stackH * 0.5) { lh = stackH * 0.5; lw = lh * LABEL_ASPECT; } // fit the face height
+    const theta = d.rotY;                       // same tiny rotation as the box stack
+    const off = boxDepth / 2 + 4;               // flush on the face, +4mm to avoid z-fighting
+    const nx = dirZ * Math.sin(theta);          // outward normal of the (rotated) front face
+    const nz = dirZ * Math.cos(theta);
+    // Lower-front placement, clamped so the whole label stays on the stack face.
+    const cLo = baseY + PALLET_H + lh / 2 + 15;
+    const cHi = baseY + PALLET_H + stackH - lh / 2 - 15;
+    const midY = cHi >= cLo
+      ? Math.max(cLo, Math.min(cHi, baseY + PALLET_H + stackH * 0.4))
+      : baseY + PALLET_H + stackH * 0.5;
+    labelQuat.setFromAxisAngle(UP, theta + (dirZ < 0 ? Math.PI : 0)); // coplanar with the face
+    posV.set(cx + nx * off, midY * vS, (cz + nz * off) * hS);
+    sclV.set(lw, lh * vS, 1);
+    worldMat.compose(posV, labelQuat, sclV);
+    outMat.multiplyMatrices(invParent, worldMat);
+    labelMesh.setMatrixAt(i, outMat);
   }
 
   palletMesh.instanceMatrix.needsUpdate = true;
+  labelMesh.instanceMatrix.needsUpdate = true;
   for (const m of boxMeshes) {
     m.instanceMatrix.needsUpdate = true;
     if (m.instanceColor) m.instanceColor.needsUpdate = true;
   }
 
-  group.add(palletMesh, ...boxMeshes);
+  group.add(palletMesh, ...boxMeshes, labelMesh);
+
+  // Render the shared branded label once, then drop the texture onto the label
+  // material. If Labelary is unreachable the labels simply stay hidden — the rest
+  // of the stock is unaffected.
+  let labelTex: THREE.Texture | null = null;
+  let labelUrl: string | null = null;
+  renderBrandedLabel()
+    .then((url) => {
+      labelUrl = url;
+      new THREE.TextureLoader().load(url, (tex) => {
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.anisotropy = 4;
+        labelTex = tex;
+        labelMat.map = tex;
+        labelMat.needsUpdate = true;
+        labelMesh.visible = true;
+      });
+    })
+    .catch(() => { /* leave labels hidden */ });
 
   return {
     group,
@@ -318,6 +414,11 @@ export function buildGoods(
       kraftMat.dispose();
       cartonMat.dispose();
       wrapMat.dispose();
+      labelMesh.geometry.dispose();
+      labelMesh.dispose();
+      labelMat.dispose();
+      labelTex?.dispose();
+      if (labelUrl) URL.revokeObjectURL(labelUrl);
     },
   };
 }
