@@ -2077,7 +2077,8 @@
     background: #475569; background-clip: padding-box; border: 2px solid transparent;
   }
   .walk-hint {
-    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    position: absolute; bottom: 16px; left: 50%;
+    transform: translateX(-50%) scale(0.82); transform-origin: bottom center;
     z-index: 10; background: rgba(0, 0, 0, 0.75); color: #e2e8f0;
     backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
