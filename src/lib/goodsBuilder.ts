@@ -2,7 +2,12 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Segment } from '../types';
 import { seededRng } from './rng';
-import { cardboardTexture, woodTexture, shrinkWrapTexture } from './goodsTextures';
+import {
+  cardboardTexture, cardboardNormal,
+  cartonTexture, cartonNormal,
+  woodTexture, woodNormal,
+  shrinkWrapTexture, shrinkWrapNormal,
+} from './goodsTextures';
 
 // Fills occupied SPACE segments with a wooden pallet and a stack of boxes.
 // Occupancy and stack shape are seeded by the segment fullName, so the layout
@@ -91,6 +96,7 @@ interface Decision {
   jitterZ: number;
   rotY: number;
   tone: number;
+  hue: number; // small per-instance colour cast, for load-to-load variety
   floor: boolean; // floor location (goods-in/packing/etc.) vs rack shelf
 }
 
@@ -103,9 +109,14 @@ const FLOOR_STACK = 1700;
 // occupied: set of backend segment ids that hold stock. When provided, goods
 // are rendered ONLY at those locations (everything else is an empty shelf).
 // When null (demo / unknown), fall back to a seeded random fill for looks.
+// worldScale mirrors the non-uniform scale on the parent worldGroup ({ y: vScale,
+// z: hScale }; X is always 1). Goods are placed compensating for it so rotated
+// pallets stay rectangular instead of being sheared by the parent stretch.
 export function buildGoods(
   segments: Segment[],
   occupied: Set<number> | null = null,
+  worldScale: { y: number; z: number } = { y: 1, z: 1 },
+  env: THREE.Texture | null = null,
 ): { group: THREE.Group; dispose: () => void } {
   const group = new THREE.Group();
   group.name = 'GOODS';
@@ -115,6 +126,16 @@ export function buildGoods(
   const spaces = segments.filter((s) => s.type === 'SPACE');
   const floorLocs = segments.filter((s) => s.isLeaf && s.type !== 'SPACE');
 
+  // Archetype mix: mostly brown kraft loads (0 single, 2 mixed pile), a smaller
+  // share of light printed cartons (1), and some stretch-wrapped (3). Keeping
+  // the bright cartons in the minority reads better for a presentation.
+  const pickArchetype = (rv: number): number => {
+    if (rv < 0.40) return 0; // kraft single (~40%)
+    if (rv < 0.50) return 1; // printed carton (~10%)
+    if (rv < 0.86) return 2; // kraft mixed pile (~36%)
+    return 3; // stretch-wrapped (~14%, and now grey rather than bright white)
+  };
+
   const decide = (s: Segment, floor: boolean): Decision | null => {
     const r = seededRng(s.fullName);
     const isOccupied = occupied ? s.id != null && occupied.has(s.id) : r() < OCCUPANCY;
@@ -122,12 +143,13 @@ export function buildGoods(
     return {
       seg: s,
       floor,
-      archetype: Math.floor(r() * 4),
+      archetype: pickArchetype(r()),
       heightFrac: 0.55 + r() * 0.4,
       jitterX: (r() - 0.5) * 25,
       jitterZ: (r() - 0.5) * 20,
       rotY: ((r() - 0.5) * 4 * Math.PI) / 180,
-      tone: 0.88 + r() * 0.18,
+      tone: 0.8 + r() * 0.32,
+      hue: r() - 0.5,
     };
   };
 
@@ -142,10 +164,35 @@ export function buildGoods(
     if (d) decisions.push(d);
   }
 
-  // Materials
-  const woodMat = new THREE.MeshStandardMaterial({ map: woodTexture(), roughness: 0.9, metalness: 0 });
-  const cardboardMat = new THREE.MeshStandardMaterial({ map: cardboardTexture(), roughness: 0.85, metalness: 0 });
-  const wrapMat = new THREE.MeshStandardMaterial({ map: shrinkWrapTexture(), roughness: 0.15, metalness: 0.05 });
+  // Materials. Normal maps add tactile relief to the flat box/pallet faces, and
+  // the shared env map gives proper indoor reflections — subtle on matte kraft,
+  // strong on the glossy stretch wrap — for a far more premium read at no runtime
+  // cost (all still instanced).
+  const woodMat = new THREE.MeshStandardMaterial({
+    map: woodTexture(), normalMap: woodNormal(),
+    roughness: 0.82, metalness: 0, envMap: env, envMapIntensity: 0.45,
+  });
+  woodMat.normalScale.set(0.7, 0.7);
+  // Plain kraft boxes (archetypes 0 and 2).
+  const kraftMat = new THREE.MeshStandardMaterial({
+    map: cardboardTexture(), normalMap: cardboardNormal(),
+    roughness: 0.95, metalness: 0, envMap: env, envMapIntensity: 0.25,
+  });
+  kraftMat.normalScale.set(0.85, 0.85);
+  // Printed retail cartons (archetype 1) — a bit smoother, more reflective.
+  const cartonMat = new THREE.MeshStandardMaterial({
+    map: cartonTexture(), normalMap: cartonNormal(),
+    roughness: 0.7, metalness: 0, envMap: env, envMapIntensity: 0.5,
+  });
+  cartonMat.normalScale.set(0.6, 0.6);
+  // Stretch-wrapped loads (archetype 3) — glossy film catching the env map.
+  const wrapMat = new THREE.MeshStandardMaterial({
+    map: shrinkWrapTexture(), normalMap: shrinkWrapNormal(),
+    roughness: 0.24, metalness: 0, envMap: env, envMapIntensity: 1.1,
+  });
+  wrapMat.normalScale.set(0.5, 0.5);
+  const boxMatFor = (archetype: number) =>
+    archetype === 3 ? wrapMat : archetype === 1 ? cartonMat : kraftMat;
 
   // Pallets — one instance per occupied space.
   const palletGeom = makePalletGeometry();
@@ -159,8 +206,7 @@ export function buildGoods(
   const counts = [0, 0, 0, 0];
   for (const d of decisions) counts[d.archetype]++;
   const boxMeshes = archetypeGeoms.map((g, i) => {
-    const mat = i === 3 ? wrapMat : cardboardMat;
-    const m = new THREE.InstancedMesh(g, mat, counts[i]);
+    const m = new THREE.InstancedMesh(g, boxMatFor(i), counts[i]);
     m.frustumCulled = false;
     m.raycast = () => {};
     m.name = `GOODS_BOXES_${i}`;
@@ -168,7 +214,22 @@ export function buildGoods(
   });
 
   // Pass 2 — place instances.
-  const dummy = new THREE.Object3D();
+  // The parent worldGroup carries a non-uniform scale (depth Z widened by hScale).
+  // Composing an instance in local space would leave that scale to SHEAR every
+  // rotated pallet — a rotation sitting between two unequal scales is a shear —
+  // which reads as skewed, tilted-looking pallets (most obvious looking up at a
+  // shelf). So instead we build each instance's intended WORLD matrix (the
+  // rotation applied to an already-stretched box, which stays rectangular) and
+  // pre-multiply by the inverse parent scale, so the on-screen result is exactly
+  // that world matrix — shear-free.
+  const { y: vS, z: hS } = worldScale;
+  const invParent = new THREE.Matrix4().makeScale(1, 1 / vS, 1 / hS);
+  const UP = new THREE.Vector3(0, 1, 0);
+  const quat = new THREE.Quaternion();
+  const posV = new THREE.Vector3();
+  const sclV = new THREE.Vector3();
+  const worldMat = new THREE.Matrix4();
+  const outMat = new THREE.Matrix4();
   const color = new THREE.Color();
   const cursors = [0, 0, 0, 0];
 
@@ -193,11 +254,15 @@ export function buildGoods(
     const palletW = footW * 0.92;
     const palletD = footD * 0.9;
 
-    dummy.position.set(cx, baseY, cz);
-    dummy.rotation.set(0, d.rotY, 0);
-    dummy.scale.set(palletW / 1200, 1, palletD / 1000);
-    dummy.updateMatrix();
-    palletMesh.setMatrixAt(i, dummy.matrix);
+    quat.setFromAxisAngle(UP, d.rotY);
+    // Pallet geom is 1200(X) x 144(Y) x 1000(Z); scale to the bin footprint and
+    // bake the parent depth-stretch into Z so the box itself is stretched (and
+    // rotated rectangular) rather than sheared.
+    posV.set(cx, baseY * vS, cz * hS);
+    sclV.set(palletW / 1200, vS, (palletD / 1000) * hS);
+    worldMat.compose(posV, quat, sclV);
+    outMat.multiplyMatrices(invParent, worldMat);
+    palletMesh.setMatrixAt(i, outMat);
 
     // box stack on top of the pallet
     const avail = d.floor ? FLOOR_STACK : Math.max(300, s.dimensionZ - HEADROOM - PALLET_H);
@@ -205,19 +270,29 @@ export function buildGoods(
     const mesh = boxMeshes[d.archetype];
     const idx = cursors[d.archetype]++;
 
-    dummy.position.set(cx, baseY + PALLET_H, cz);
-    dummy.rotation.set(0, d.rotY, 0);
+    posV.set(cx, (baseY + PALLET_H) * vS, cz * hS);
     // Boxes a touch larger than the pallet (slight realistic overhang) so the
     // load sits equal-to / a little bigger than the bin opening.
-    dummy.scale.set(palletW * 1.04, stackH, palletD * 1.04);
-    dummy.updateMatrix();
-    mesh.setMatrixAt(idx, dummy.matrix);
+    sclV.set(palletW * 1.04, stackH * vS, palletD * 1.04 * hS);
+    worldMat.compose(posV, quat, sclV);
+    outMat.multiplyMatrices(invParent, worldMat);
+    mesh.setMatrixAt(idx, outMat);
 
     if (d.archetype === 3) {
-      // shrink wrap: subtle blue-white variation
-      color.setRGB(d.tone * 0.95 + 0.05, d.tone * 0.97 + 0.03, 1);
+      // stretch wrap: muted grey film (light→mid grey, faint cool cast) rather
+      // than a glaring bright-white block — reads far better in a presentation.
+      const g = 0.6 + (d.tone - 0.8) * 0.6; // tone 0.8..1.12 → ~0.6..0.79
+      color.setRGB(g * 0.99, g, g * 1.04);
+    } else if (d.archetype === 1) {
+      // printed cartons: bright, near-neutral with a faint cast either way
+      const t = 0.9 + (d.tone - 0.8) * 0.55;
+      color.setRGB(t + d.hue * 0.05, t, t - d.hue * 0.04);
     } else {
-      color.setRGB(d.tone, d.tone, d.tone);
+      // kraft: soft warm tan. Lift the floor (remap tone into a tight, bright
+      // band) so boxes vary gently without any going muddy-dark, and keep the
+      // warmth subtle so it doesn't read as heavy brown.
+      const k = 0.92 + (d.tone - 0.8) * 0.4; // tone 0.8..1.12 → ~0.92..1.05
+      color.setRGB(k, k * (0.97 + d.hue * 0.03), k * (0.92 + d.hue * 0.04));
     }
     mesh.setColorAt(idx, color);
   }
@@ -240,7 +315,8 @@ export function buildGoods(
         m.dispose();
       }
       woodMat.dispose();
-      cardboardMat.dispose();
+      kraftMat.dispose();
+      cartonMat.dispose();
       wrapMat.dispose();
     },
   };

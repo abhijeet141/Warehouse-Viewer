@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
   import * as THREE from 'three';
   import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+  import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
   import { RailControls } from './railControls';
+  import { TourController } from './tourController';
   import { buildRacks, buildAisleSigns, buildPallets, buildSafetyNets, groupBaysIntoRows } from './rackBuilder';
   import { buildEnvironment, type ShellBounds } from './environmentBuilder';
   import { buildGoods } from './goodsBuilder';
@@ -14,38 +17,34 @@
   // Demo stock toggle: when true, occupied bins are filled with pallets + box
   // stacks (seeded demo fill). Built lazily on first enable.
   export let showStock = false;
+  // Building shell (roof, walls, columns, lights) visibility — toggled from the
+  // App header. Off = open overview that can pull back past the walls.
+  export let showShell = true;
   export let camera: {
     position: [number, number, number];
     fov?: number;
     near?: number;
     far?: number;
-  // Default vantage (data mm): close in front of the aisle entrances, mid-rack
-  // height, looking down the aisles — the front rack row roughly fills the
-  // frame so individual spaces read near their real size. Scroll out for the
-  // whole-building view. fov 40 keeps a telephoto look (less perspective
+  // Default vantage (data mm): an elevated corner overview looking diagonally
+  // across the rack block — the angled hero shot used on load and Reset. Scroll
+  // in for individual spaces. fov 40 keeps a telephoto look (less perspective
   // shrink than the old 50).
-  } = { position: [-22000, 11000, 43525], fov: 40, near: 100, far: 800000 };
+  } = { position: [-7763, 20178, -16741], fov: 40, near: 100, far: 800000 };
   export let orbit: {
     target: [number, number, number];
     minDistance: number;
     maxDistance: number;
   // maxDistance keeps zoom-out within the building; the shell clamp in
   // animate() hard-stops the camera at the walls/roof either way.
-  } = { target: [53700, 7825, 43525], minDistance: 1000, maxDistance: 160000 };
-  export let grid: {
-    size: number;
-    cellSize: number;
-    sectionSize: number;
-    centerXZ: [number, number];
-    fadeDistance?: number;
-    fadeStrength?: number;
-  } = { size: 230000, cellSize: 2000, sectionSize: 6000, centerXZ: [53700, 43525], fadeDistance: 150000, fadeStrength: 1 };
+  } = { target: [61159, 7825, 39979], minDistance: 1000, maxDistance: 160000 };
   export let floorY = 100;
 
-  // eyeHeight: drop in at the third rack level (C: 5200–7700mm); fov 70 keeps
-  // the wide phone-camera feel so the aisle reads as a walkable lane. Ride
-  // down with Q to drop to floor level.
-  export let walk: { eyeHeight: number; moveSpeed: number; fov: number } = { eyeHeight: 6450, moveSpeed: 6000, fov: 70 };
+  // eyeHeight: drop in at the third rack level (C: 5200–7700mm). fov 50 (≈80°
+  // horizontal at 16:9) matches natural forward-focused human vision — the way
+  // ahead stays the primary focus and the side racks sit toward the edges,
+  // rather than the old 70 (≈100°+ horizontal) which showed too much periphery.
+  // Ride down with Q to drop to floor level.
+  export let walk: { eyeHeight: number; moveSpeed: number; fov: number } = { eyeHeight: 6450, moveSpeed: 6000, fov: 50 };
 
   const COLOR_MAP: Record<SegmentType, number> = {
     AISLE: 0x3b82f6,
@@ -71,27 +70,28 @@
   // hoverable via raycast).
   const WALK_OPACITY: Record<SegmentType, number> = { AISLE: 0.04, BAY: 0.25, LEVEL: 0.55, SPACE: 0 };
 
-  const SPACE_HOVER_COLOR   = 0x7f1d1d;
-  const SPACE_HOVER_OPACITY = 0.95;
+  // Stock hover: a modern sky-blue accent — distinct from the blue UI chrome and
+  // the yellow find boxes, and a clean contrast against the orange stock. A
+  // translucent fill reads as a soft glow rather than a solid block, with a crisp
+  // outline on top. Both fade in/out (see HOVER_FADE_* and updateHighlightFade).
+  const SPACE_HOVER_COLOR        = 0x38bdf8;
+  const SPACE_HOVER_FILL_OPACITY = 0.40;
+  const SPACE_HOVER_EDGE_OPACITY = 0.95;
+  const HOVER_FADE_IN  = 0.12; // seconds to fade a highlight in
+  const HOVER_FADE_OUT = 0.20; // seconds to fade a highlight out
 
-  const FIND_COLOR = 0xfacc15;
+  // Search-hit marker: a vivid violet beacon. It pops against both the warm tan
+  // stock and the cool blue racks (and is distinct from the sky-blue hover, the
+  // green status chip and the red schematic tier), so a found location reads
+  // instantly in a presentation. FIND_EDGE is a lighter violet for the outline.
+  const FIND_COLOR = 0xa855f7;
+  const FIND_EDGE  = 0xd8b4fe;
 
+  // Find/search: only the 3D side lives here now (highlight boxes + camera
+  // fly-to). The search input, suggestions and status UI live in the App header
+  // and drive this via the exported findLocation()/clearFind() methods.
   let findGroup: THREE.Group | null = null;
   let findMatchSegs: Segment[] = [];
-  let findQuery = '';
-  let findStatus = '';
-  let findStatusKind: 'ok' | 'err' = 'ok';
-  let findInputEl: HTMLInputElement;
-  let suggestions: Segment[] = [];
-  let suggestionsOpen = false;
-  let activeSuggestion = -1;
-
-  const TYPE_HEX: Record<SegmentType, string> = {
-    AISLE: '#3b82f6',
-    BAY:   '#f97316',
-    LEVEL: '#22c55e',
-    SPACE: '#ef4444',
-  };
 
   let container: HTMLDivElement;
   let canvas: HTMLCanvasElement;
@@ -103,16 +103,32 @@
     coords: [number, number, number];
     dims:   [number, number, number];
   } | null = null;
+  // Source data is millimetres; show metres (more intuitive at warehouse scale),
+  // trimmed to at most 2 decimals.
+  const toMetres = (mm: number) => String(Math.round(mm / 10) / 100);
+
+  const dispatch = createEventDispatcher<{ ready: void; tour: boolean }>();
+  let firstRendered = false; // fires `ready` once the first frame is on screen
 
   let scene: THREE.Scene;
   let perspectiveCamera: THREE.PerspectiveCamera;
   let renderer: THREE.WebGLRenderer;
+  let resizeObserver: ResizeObserver | null = null;
   let controls: OrbitControls;
   let raycaster: THREE.Raycaster;
   let pointer: THREE.Vector2;
   let rafId = 0;
 
   let rail: RailControls;
+  let tour: TourController;
+  let tourActive = false;
+  let tourPaused = false; // tour running but frozen in place; resumes from here
+  // Playback speed for the virtual tour: scales the time-step fed to the tour so
+  // travel, dwells and head-turns all slow down / speed up together. 1 = current.
+  const TOUR_SPEEDS = [0.25, 0.5, 1, 1.25, 1.5, 2];
+  let tourSpeed = 1;
+  let tourSpeedOpen = false; // speed-picker popover
+  let tourEntering = false;  // mid cinematic fly-in from the overview into aisle 1
   let clock: THREE.Clock;
   let mode: 'orbit' | 'walk' = 'orbit';
   let aisleLabel = '';
@@ -127,10 +143,32 @@
   let rackTopY = 0; // tallest segment top (world Y), for arcing flights over the racks
   let highlightGroup: THREE.Group | null = null;
   let highlightedId: number | null = null;
-  let gridMesh: THREE.Mesh | null = null;
+  // Highlights mid fade-out: kept alive each frame until their opacity hits 0,
+  // then removed + disposed. Enables a smooth cross-fade between hovered items.
+  let fadingHighlights: THREE.Group[] = [];
+  // Tour showcase: the whole rack LEVEL (shelf) currently being inspected, plus
+  // the list of storage locations on it for the floating panel.
+  let tourLevel: string | null = null;
+  let tourLevelInfo: { level: string; levelSeg: Segment; spaces: Segment[] } | null = null;
+  // Indices for resolving a space → its level + sibling locations, and a bay → its
+  // shelves (bottom-to-top) for the tour's per-level inspection.
+  const levelByName = new Map<string, Segment>();
+  const spacesByLevel = new Map<string, Segment[]>();
+  const levelsByBay = new Map<string, Segment[]>();
+  const levelNameOf = (spaceName: string) => spaceName.replace(/\d+$/, ''); // "A25C03" → "A25C"
+  const bayNameOf = (levelName: string) => levelName.replace(/[A-Za-z]+$/, ''); // "A25C" → "A25"
+  const aisleLetterOf = (name: string) => (name.match(/^[A-Za-z]+/)?.[0] ?? name).toUpperCase();
+  // Bay centre X positions per aisle letter — used to snap tour stops onto a bay.
+  const bayXsByAisle = new Map<string, number[]>();
   let realisticDisposers: Array<() => void> = [];
   let goodsHandle: { group: THREE.Group; dispose: () => void } | null = null;
+  let goodsEnv: THREE.Texture | null = null; // PMREM env map for realistic goods reflections
   let shellBounds: ShellBounds | null = null;
+  // Building shell (controlled from the App header). When off, the roof deck,
+  // walls, steel columns/rafters and hanging lights all hide together and the
+  // ceiling cage lifts so the camera can pull back for a full open overview.
+  let roofMesh: THREE.Mesh | null = null;
+  let roofExtras: THREE.Object3D[] = [];
 
   // Arrow-key navigation in orbit mode: ↑/↓ glide forward/back along the view,
   // ←/→ strafe across the floor. Walk mode handles arrows via RailControls, so
@@ -159,78 +197,6 @@
   let pointerDownY = 0;
   const ARROW_COLOR = 0x2563eb;
   const ARROW_HOVER = 0x60a5fa;
-
-  // Procedural anti-aliased floor grid (port of drei's <Grid>), retuned as
-  // faint concrete expansion joints over the slab; fades with distance.
-  function makeShaderGrid(): THREE.Mesh {
-    const planeGeom = new THREE.PlaneGeometry(grid.size, grid.size);
-    planeGeom.rotateX(-Math.PI / 2);
-
-    const mat = new THREE.ShaderMaterial({
-      uniforms: {
-        uCellSize:         { value: grid.cellSize },
-        uSectionSize:      { value: grid.sectionSize },
-        uCellColor:        { value: new THREE.Color(0xa6abb1) },
-        uSectionColor:     { value: new THREE.Color(0x9aa0a6) },
-        uCellThickness:    { value: 1.0 },
-        uSectionThickness: { value: 1.8 },
-        uFadeDistance:     { value: grid.fadeDistance ?? 400000 },
-        uFadeStrength:     { value: grid.fadeStrength ?? 1.0 },
-        uCameraPos:        { value: new THREE.Vector3() },
-      },
-      vertexShader: `
-        varying vec3 vWorldPos;
-        void main() {
-          vec4 wp = modelMatrix * vec4(position, 1.0);
-          vWorldPos = wp.xyz;
-          gl_Position = projectionMatrix * viewMatrix * wp;
-        }
-      `,
-      fragmentShader: `
-        uniform float uCellSize;
-        uniform float uSectionSize;
-        uniform vec3  uCellColor;
-        uniform vec3  uSectionColor;
-        uniform float uCellThickness;
-        uniform float uSectionThickness;
-        uniform float uFadeDistance;
-        uniform float uFadeStrength;
-        uniform vec3  uCameraPos;
-        varying vec3 vWorldPos;
-
-        float gridLine(vec2 coord, float thickness) {
-          vec2 g = abs(fract(coord - 0.5) - 0.5) / fwidth(coord);
-          float line = min(g.x, g.y);
-          return 1.0 - min(line / thickness, 1.0);
-        }
-
-        void main() {
-          vec2 xz = vWorldPos.xz;
-          float cell    = gridLine(xz / uCellSize,    uCellThickness);
-          float section = gridLine(xz / uSectionSize, uSectionThickness);
-
-          vec3 color = mix(uCellColor, uSectionColor, section);
-          float alpha = section * 0.3 + cell * 0.0;
-
-          float dist = distance(uCameraPos.xz, xz);
-          float fade = 1.0 - smoothstep(uFadeDistance * 0.5, uFadeDistance, dist);
-          alpha *= pow(fade, uFadeStrength);
-
-          if (alpha < 0.01) discard;
-          gl_FragColor = vec4(color, alpha);
-        }
-      `,
-      transparent: true,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-
-    const mesh = new THREE.Mesh(planeGeom, mat);
-    mesh.position.set(grid.centerXZ[0], 2, grid.centerXZ[1]);
-    mesh.renderOrder = -1;
-    mesh.raycast = () => {};
-    return mesh;
-  }
 
   function makeContainerMesh(seg: Segment): THREE.Group {
     const group = new THREE.Group();
@@ -353,14 +319,17 @@
     if (!outlineOnly) {
       const mat = new THREE.MeshStandardMaterial({
         color: SPACE_HOVER_COLOR,
+        emissive: SPACE_HOVER_COLOR, // gentle self-lit glow so it reads at any angle
+        emissiveIntensity: 0.35,
         transparent: true,
-        opacity: SPACE_HOVER_OPACITY,
+        opacity: SPACE_HOVER_FILL_OPACITY,
         depthWrite: false,
         depthTest: !seeThrough,
         polygonOffset: !seeThrough,
         polygonOffsetFactor: -1,
         polygonOffsetUnits: -1,
       });
+      mat.userData.baseOpacity = SPACE_HOVER_FILL_OPACITY;
       const mesh = new THREE.Mesh(geom, mat);
       mesh.position.copy(center);
       mesh.renderOrder = 5; // above the tier boxes (0–2)
@@ -370,10 +339,11 @@
 
     const edgeGeom = new THREE.EdgesGeometry(geom);
     const edgeMat = new THREE.LineBasicMaterial({
-      color: SPACE_HOVER_COLOR, transparent: true,
+      color: SPACE_HOVER_COLOR, transparent: true, opacity: SPACE_HOVER_EDGE_OPACITY,
       depthTest: !seeThrough,
       polygonOffset: !seeThrough, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
     });
+    edgeMat.userData.baseOpacity = SPACE_HOVER_EDGE_OPACITY;
     const edges = new THREE.LineSegments(edgeGeom, edgeMat);
     edges.position.copy(center);
     // Outline-only sits on top of the find box (scale 1.02), so push it out
@@ -401,7 +371,8 @@
     );
   }
 
-  function clearFind() {
+  // Exported: the App-header search clears its highlight through here.
+  export function clearFind() {
     findMatchSegs = [];
     if (!findGroup) return;
     worldGroup.remove(findGroup);
@@ -421,8 +392,16 @@
     const mesh = new THREE.Mesh(
       geom,
       new THREE.MeshStandardMaterial({
-        color: FIND_COLOR, transparent: true, opacity: 0.85,
-        depthWrite: false, depthTest: false, side: THREE.DoubleSide,
+        // A glowing, translucent fill rather than a heavy opaque block, so the
+        // marked stock still shows through. depthTest ON so the structure in
+        // front occludes it — it reads as sitting INSIDE its slot and stays
+        // anchored there as the view orbits (depthTest off made it draw over
+        // everything, so it looked like it floated in the aisle). polygonOffset
+        // keeps the front face off the coplanar rack/stock face (no z-fighting).
+        color: FIND_COLOR, emissive: FIND_COLOR, emissiveIntensity: 0.45,
+        transparent: true, opacity: 0.5,
+        depthWrite: false, depthTest: true, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
       }),
     );
     mesh.position.set(
@@ -436,7 +415,10 @@
 
     const edges = new THREE.LineSegments(
       new THREE.EdgesGeometry(geom),
-      new THREE.LineBasicMaterial({ color: FIND_COLOR, transparent: true, depthTest: false }),
+      new THREE.LineBasicMaterial({
+        color: FIND_EDGE, transparent: true, depthTest: true,
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+      }),
     );
     edges.position.copy(mesh.position);
     edges.scale.set(1.02, 1.02, 1.02);
@@ -485,6 +467,8 @@
     fromPos: THREE.Vector3; fromTarget: THREE.Vector3;
     toPos: THREE.Vector3; toTarget: THREE.Vector3;
     start: number; duration: number; bow: number;
+    fromFov?: number; toFov?: number;  // optional fov ease (overview → walk)
+    onDone?: () => void;               // fired once the flight completes
   } | null = null;
 
   const easeInOutCubic = (t: number) =>
@@ -497,7 +481,15 @@
     perspectiveCamera.position.lerpVectors(camTween.fromPos, camTween.toPos, e);
     perspectiveCamera.position.y += camTween.bow * Math.sin(Math.PI * e);
     controls.target.lerpVectors(camTween.fromTarget, camTween.toTarget, e);
-    if (t >= 1) camTween = null;
+    if (camTween.fromFov !== undefined && camTween.toFov !== undefined) {
+      perspectiveCamera.fov = camTween.fromFov + (camTween.toFov - camTween.fromFov) * e;
+      perspectiveCamera.updateProjectionMatrix();
+    }
+    if (t >= 1) {
+      const done = camTween.onDone;
+      camTween = null;
+      done?.();
+    }
   }
 
   // Straight flight path blocked by a rack? The SPACE instances fill every
@@ -554,19 +546,18 @@
     };
   }
 
-  function findLocation(query?: string) {
-    if (query !== undefined) findQuery = query;
-    suggestionsOpen = false;
-    activeSuggestion = -1;
+  // Exported: the App-header search calls this to fly to a location and draw the
+  // yellow match boxes. Returns a status the header shows to the user.
+  export function findLocation(query: string): { ok: boolean; message: string } {
     clearFind();
-    const q = findQuery.trim().toUpperCase();
-    if (!q) { findStatus = ''; return; }
+    const q = query.trim().toUpperCase();
+    if (!q) return { ok: true, message: '' };
     if (mode === 'walk') exitWalk(); // searching is an overview action; pop out to orbit
 
     const exact = segments.filter((s) => s.fullName.toUpperCase() === q);
     const matches = exact.length ? exact : segments.filter((s) => s.fullName.toUpperCase().startsWith(q));
 
-    if (matches.length === 0) { findStatus = `"${findQuery}" not found`; findStatusKind = 'err'; return; }
+    if (matches.length === 0) return { ok: false, message: `"${query.trim()}" not found` };
 
     findGroup = new THREE.Group();
     const box = new THREE.Box3();
@@ -581,67 +572,24 @@
     }
     worldGroup.add(findGroup);
     findMatchSegs = matches;
-    findStatus = matches.length === 1 ? `Found ${matches[0].fullName}` : `Found ${matches.length} matches`;
-    findStatusKind = 'ok';
     frameBox(widenToBayContext(matches, box));
+    return {
+      ok: true,
+      message: matches.length === 1 ? `Found ${matches[0].fullName}` : `Found ${matches.length} matches`,
+    };
   }
 
-  function updateSuggestions() {
-    findStatus = '';
-    const q = findQuery.trim().toUpperCase();
-    if (!q) {
-      suggestions = []; suggestionsOpen = false; activeSuggestion = -1;
-      return;
-    }
-    const out: Segment[] = [];
-    for (const s of segments) {
-      if (s.fullName.toUpperCase().startsWith(q)) {
-        out.push(s);
-        if (out.length >= 8) break;
-      }
-    }
-    suggestions = out;
-    suggestionsOpen = out.length > 0;
-    activeSuggestion = -1;
-  }
-
-  function clearSearch() {
-    findQuery = '';
-    findStatus = '';
-    suggestions = [];
-    suggestionsOpen = false;
-    activeSuggestion = -1;
-    clearFind();
-    findInputEl?.focus();
-  }
-
-  function onFindKeydown(e: KeyboardEvent) {
-    if (e.key === 'ArrowDown' && suggestionsOpen) {
-      e.preventDefault();
-      activeSuggestion = (activeSuggestion + 1) % suggestions.length;
-    } else if (e.key === 'ArrowUp' && suggestionsOpen) {
-      e.preventDefault();
-      activeSuggestion = (activeSuggestion - 1 + suggestions.length) % suggestions.length;
-    } else if (e.key === 'Enter') {
-      if (suggestionsOpen && activeSuggestion >= 0) findLocation(suggestions[activeSuggestion].fullName);
-      else findLocation();
-    } else if (e.key === 'Escape') {
-      if (suggestionsOpen) { suggestionsOpen = false; activeSuggestion = -1; }
-      else clearSearch();
-    }
-  }
-
-  // "/" anywhere on the page jumps to the search box (ignored while typing in
-  // a field). Esc closes the aisle picker first, then exits walk mode.
+  // Esc closes the aisle picker first, then exits walk mode. Arrow keys drive
+  // the orbit camera. ("/" to focus search is handled in the App header now.)
   function onWindowKeydown(e: KeyboardEvent) {
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
-    if (e.key === '/') {
-      e.preventDefault();
-      findInputEl?.focus();
-    } else if (e.key === 'Escape') {
+    if (e.key === 'Escape') {
       if (aislePickerOpen) aislePickerOpen = false;
-      else if (mode === 'walk') exitWalk();
+      else if (mode === 'walk') exitOneLevel(); // tour → walkway → overview, one step
+    } else if (e.code === 'Space' && mode === 'walk' && tourActive) {
+      toggleTourPause(); // spacebar = hold / continue the tour (handy for a live demo)
+      e.preventDefault();
     } else if (mode === 'orbit') {
       switch (e.code) {
         case 'ArrowUp':    orbitKeys.fwd = true; break;
@@ -651,6 +599,7 @@
         default: return;
       }
       camTween = null; // grabbing the keys cancels any in-flight search tween
+      clearHighlight(); // navigating with the keys drops the cursor hover
       e.preventDefault();
     }
   }
@@ -693,33 +642,73 @@
     controls.target.z += dz;
   }
 
-  $: qLen = findQuery.trim().length;
+  function disposeHighlightGroup(group: THREE.Group) {
+    worldGroup.remove(group);
+    group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh || obj instanceof THREE.LineSegments) {
+        obj.geometry.dispose();
+        const mt = obj.material as THREE.Material | THREE.Material[];
+        if (Array.isArray(mt)) mt.forEach((m) => m.dispose());
+        else mt.dispose();
+      }
+    });
+  }
 
+  // Scale every tagged material's opacity by f (0–1) so the whole group fades as
+  // one. Stored baseOpacity keeps the fill/outline at their distinct strengths.
+  function applyHighlightFade(group: THREE.Group, f: number) {
+    group.userData.fade = f;
+    group.traverse((obj) => {
+      const mat = (obj as THREE.Mesh | THREE.LineSegments).material as THREE.Material | undefined;
+      const base = mat?.userData?.baseOpacity;
+      if (mat && base !== undefined) mat.opacity = base * f;
+    });
+  }
+
+  // Send the current highlight into a fade-out instead of removing it instantly,
+  // so it dissolves smoothly (and cross-fades with whatever comes next).
   function clearHighlight() {
     if (highlightGroup) {
-      worldGroup.remove(highlightGroup);
-      highlightGroup.traverse((obj) => {
-        if (obj instanceof THREE.Mesh || obj instanceof THREE.LineSegments) {
-          obj.geometry.dispose();
-          const mt = obj.material as THREE.Material | THREE.Material[];
-          if (Array.isArray(mt)) mt.forEach((m) => m.dispose());
-          else mt.dispose();
-        }
-      });
+      fadingHighlights.push(highlightGroup);
       highlightGroup = null;
     }
     highlightedId = null;
     hoverInfo = null;
+    tourLevel = null;
+    tourLevelInfo = null;
+  }
+
+  // Tour showcase: highlight the whole rack LEVEL (shelf) being inspected and
+  // surface every storage location on it. Deduped by level so it only rebuilds
+  // (cross-fading) when the camera moves to a different shelf.
+  function applyLevelShowcase(levelName: string) {
+    if (levelName === tourLevel) return;
+    const lvl = levelByName.get(levelName);
+    if (!lvl) { clearHighlight(); return; }
+    if (highlightGroup) fadingHighlights.push(highlightGroup); // cross-fade out the old shelf
+    highlightedId = null;
+    hoverInfo = null;
+    tourLevel = levelName;
+    tourLevelInfo = { level: levelName, levelSeg: lvl, spaces: spacesByLevel.get(levelName) ?? [] };
+    const group = makeHighlightGroup(lvl); // a box spanning the whole shelf
+    applyHighlightFade(group, 0);          // start invisible, eases up via the fade loop
+    worldGroup.add(group);
+    highlightGroup = group;
   }
 
   function applyHighlight(instanceId: number) {
     if (instanceId === highlightedId) return;
-    clearHighlight();
+    if (highlightGroup) fadingHighlights.push(highlightGroup); // fade the previous one out
+    highlightGroup = null;
     const seg = spaceSegments[instanceId];
-    if (!seg) return;
+    if (!seg) { highlightedId = null; hoverInfo = null; return; }
     highlightedId = instanceId;
-    highlightGroup = makeHighlightGroup(seg, isInsideFind(seg));
-    worldGroup.add(highlightGroup);
+    tourLevel = null;
+    tourLevelInfo = null;
+    const group = makeHighlightGroup(seg, isInsideFind(seg));
+    applyHighlightFade(group, 0); // start invisible, fade up in updateHighlightFade()
+    worldGroup.add(group);
+    highlightGroup = group;
     hoverInfo = {
       fullName: seg.fullName,
       type: seg.type,
@@ -728,12 +717,39 @@
     };
   }
 
+  // Per-frame highlight fading: the active group eases toward full, queued groups
+  // ease toward zero and are disposed once invisible. Capped so a fast cursor
+  // sweep can't pile up unbounded fade-outs.
+  function updateHighlightFade(dt: number) {
+    if (highlightGroup) {
+      const f = Math.min(1, (highlightGroup.userData.fade ?? 0) + dt / HOVER_FADE_IN);
+      applyHighlightFade(highlightGroup, f);
+    }
+    while (fadingHighlights.length > 8) disposeHighlightGroup(fadingHighlights.shift()!);
+    for (let i = fadingHighlights.length - 1; i >= 0; i--) {
+      const g = fadingHighlights[i];
+      const f = (g.userData.fade ?? 1) - dt / HOVER_FADE_OUT;
+      if (f <= 0) {
+        disposeHighlightGroup(g);
+        fadingHighlights.splice(i, 1);
+      } else {
+        applyHighlightFade(g, f);
+      }
+    }
+  }
+
   function onPointerMove(event: PointerEvent) {
+    // While the tour is actively playing it drives its own showcase highlight, so
+    // ignore cursor hover entirely (moving the mouse mustn't light up stock). When
+    // PAUSED, though, the user is inspecting by hand — track the cursor and show
+    // the level banner for the rack under it.
+    if (tourActive && !tourPaused) return;
     const rect = canvas.getBoundingClientRect();
     pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
     pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
     tooltipX = event.clientX - rect.left;
     tooltipY = event.clientY - rect.top;
+    if (tourActive && tourPaused) { updatePausedHover(); return; }
 
     // Aisle arrows take priority over space hover (they sit on the open floor).
     if (mode === 'orbit' && arrowMeshes.length > 0) {
@@ -825,6 +841,7 @@
 
   function onCanvasPointerDown(e: PointerEvent) {
     aislePickerOpen = false;
+    tourSpeedOpen = false;
     pointerDownX = e.clientX;
     pointerDownY = e.clientY;
   }
@@ -854,6 +871,76 @@
     const hits = raycaster.intersectObject(spaceInst, false);
     if (hits.length > 0 && hits[0].instanceId !== undefined) applyHighlight(hits[0].instanceId);
     else clearHighlight();
+  }
+
+  // Hover while the tour is paused: same as updateHover, but surfaces the whole
+  // LEVEL of the rack under the cursor (the tour's level banner) instead of the
+  // single-space tooltip. Re-raycast per frame since the camera moves under a
+  // stationary cursor as the user walks/rides during the pause.
+  function updatePausedHover() {
+    const spaceInst = tierInstancedMeshes.get('SPACE');
+    if (!spaceInst) { clearHighlight(); return; }
+    raycaster.setFromCamera(pointer, perspectiveCamera);
+    const hits = raycaster.intersectObject(spaceInst, false);
+    if (hits.length > 0 && hits[0].instanceId !== undefined) {
+      const seg = spaceSegments[hits[0].instanceId];
+      if (seg) { applyLevelShowcase(levelNameOf(seg.fullName)); return; }
+    }
+    clearHighlight();
+  }
+
+  // Tour showcase: cast from the centre of the view into the rack the camera is
+  // inspecting, find the space in view, and highlight its whole LEVEL (shelf) +
+  // list the locations on it. Only while paused and looking at a rack
+  // (tour.showcasing); the far clamp keeps it to a close shelf.
+  const TOUR_AIM = new THREE.Vector2(0, 0);
+  function updateTourHover() {
+    // The tour reports which shelf it's inspecting; highlight that directly (no
+    // per-frame raycast, so steep top/bottom shelves still highlight reliably).
+    if (tour.showcasing && tour.inspectLevel) applyLevelShowcase(tour.inspectLevel);
+    else clearHighlight();
+  }
+
+  // For the tour: bay-centre distances along an aisle (so showcase stops land on a
+  // bay, centring the faced rack rather than straddling two bays).
+  function bayCentersForAisle(i: number): number[] {
+    const a = rail?.aisles[i];
+    if (!a) return [];
+    const xs = bayXsByAisle.get(aisleLetterOf(a.name));
+    if (!xs) return [];
+    const out = new Set<number>();
+    for (const x of xs) {
+      const d = (x - a.start.x) * a.dir.x; // distance along the aisle (runs along X)
+      if (d >= 0 && d <= a.length) out.add(Math.round(d));
+    }
+    return [...out].sort((p, q) => p - q);
+  }
+
+  // For the tour: every shelf of the bay the camera currently faces, paired with
+  // the pitch elevation to look at it (ascending, bottom→top). The tour sweeps the
+  // pitch across these and highlights the nearest shelf as it goes.
+  function planVerticalInspection(): { pitch: number; level: string }[] | null {
+    const spaceInst = tierInstancedMeshes.get('SPACE');
+    if (!spaceInst) return null;
+    raycaster.setFromCamera(TOUR_AIM, perspectiveCamera);
+    const prevFar = raycaster.far;
+    raycaster.far = 14000;
+    const hits = raycaster.intersectObject(spaceInst, false);
+    raycaster.far = prevFar;
+    if (!hits.length || hits[0].instanceId === undefined) return null;
+    const seg = spaceSegments[hits[0].instanceId];
+    if (!seg) return null;
+    const levels = levelsByBay.get(bayNameOf(levelNameOf(seg.fullName)));
+    if (!levels || levels.length === 0) return null;
+
+    const cam = perspectiveCamera.position;
+    // Pitch (elevation) to look at a level's world centre from the camera.
+    return levels.map((lv) => {
+      const wx = lv.coordinateX + lv.dimensionX / 2;
+      const wy = (lv.coordinateZ + lv.dimensionZ / 2) * vScale;
+      const wz = (lv.coordinateY + lv.dimensionY / 2) * hScale;
+      return { pitch: Math.atan2(wy - cam.y, Math.hypot(wx - cam.x, wz - cam.z)), level: lv.fullName };
+    });
   }
 
   // depthWrite stays false for every tier in both modes: writing depth from a
@@ -894,9 +981,139 @@
     if (aisleIdx !== undefined) rail.setAisle(aisleIdx);
   }
 
+  // Virtual tour: an autopilot that drives the rail through every aisle in a
+  // serpentine loop. Requires walk mode (it builds on the rail), so starting it
+  // from orbit drops into walk first.
+  function startTour() {
+    if (mode !== 'walk') enterWalk();
+    clearHighlight(); // drop any cursor hover box before suppressing hover for the tour
+    tour.start();
+    tourActive = true;
+    tourPaused = false;
+  }
+
+  // Cinematic tour launch from the overview: smoothly fly the camera down from
+  // wherever it's parked into the mouth of the first aisle — sweeping the look
+  // from the whole rack block to straight down the aisle and easing the fov to
+  // the walk lens — then hand off to walk mode and start the autopilot. The
+  // handoff pose matches the rail's dist-0 pose exactly, so there's no snap.
+  function startTourFromOverview() {
+    if (!rail || rail.aisles.length === 0 || tourEntering) return;
+    if (mode !== 'orbit') { startTour(); return; } // already inside — just start
+    aislePickerOpen = false;
+    tourSpeedOpen = false;
+    tourEntering = true;
+
+    const idx = 0; // aisle 1 (sorted) — a consistent presentation start
+    const a = rail.aisles[idx];
+    const eyeY = walk.eyeHeight * vScale;
+    const dirH = a.dir.clone(); dirH.y = 0; dirH.normalize();
+
+    // The fly-in is split into two legs so the camera always enters along the
+    // aisle's own axis — never on a diagonal that skims a rack face on the way in.
+    //  • STAGE_BACK: a staging point this far IN FRONT of the aisle mouth, out on
+    //    the open cross-aisle floor, sitting on the walkway centreline.
+    //  • ENTRY_OFFSET: where it comes to rest just inside the mouth.
+    // Leg 1 descends from the overview to the staging point (looking straight down
+    // the aisle); leg 2 then glides forward along the centreline into the mouth, so
+    // the camera holds the middle of the walkway the whole time it passes the racks.
+    const STAGE_BACK = 14000;
+    const ENTRY_OFFSET = 3000;
+    const stagePos = a.start.clone().addScaledVector(dirH, -STAGE_BACK); stagePos.y = eyeY;
+    const entryPos = a.start.clone().addScaledVector(dirH, ENTRY_OFFSET); entryPos.y = eyeY;
+    const lookTarget = a.start.clone().addScaledVector(dirH, 35000); lookTarget.y = eyeY; // down the aisle
+
+    const fromPos = perspectiveCamera.position.clone();
+    let bow = 0;
+    // Leg 1 ends in front of the mouth (open floor), so it can only be blocked when
+    // the overview is parked on the far side of the rack block — arc up and over then.
+    if (flightIsBlocked(fromPos, stagePos)) {
+      bow = Math.max(0, rackTopY * vScale + 4000 - (fromPos.y + stagePos.y) / 2);
+    }
+
+    // Leg 2: a straight, centred glide from the staging point into the walkway.
+    const enterAlongAisle = () => {
+      camTween = {
+        fromPos: stagePos.clone(),
+        fromTarget: lookTarget.clone(),
+        toPos: entryPos,
+        toTarget: lookTarget.clone(),
+        start: performance.now(),
+        duration: 2600, // a slow, deliberate glide in — lets the walkway read before the tour starts
+        bow: 0, // pure axial move along the centreline — stays dead-centre, no arc
+        onDone: () => {
+          enterWalk(idx);        // walk mode at aisle 1, camera already at the entry pose
+          // enterWalk → setAisle resets dist to 0. Re-derive it from the camera's actual
+          // landing position so the tour seeds from the centre of the walkway.
+          rail.syncFromCamera();
+          clearHighlight();
+          tour.start();          // seeds the serpentine from the synced dist
+          tourActive = true;
+          tourPaused = false;
+          tourEntering = false;
+        },
+      };
+    };
+
+    // Leg 1: descend from wherever the overview is parked to the staging point,
+    // easing the lens to the walk fov and swinging the look straight down the aisle.
+    camTween = {
+      fromPos,
+      fromTarget: controls.target.clone(),
+      toPos: stagePos,
+      toTarget: lookTarget.clone(),
+      start: performance.now(),
+      duration: 2400, // slow, deliberate descent toward the aisle mouth
+      bow,
+      fromFov: perspectiveCamera.fov,
+      toFov: walk.fov,
+      onDone: enterAlongAisle,
+    };
+  }
+
+  function stopTour() {
+    if (tour) tour.stop();
+    tourActive = false;
+    tourPaused = false;
+  }
+
+  // Freeze / unfreeze the running tour in place (the camera holds its frame and
+  // any inspected-level panel stays up); resuming continues from that point.
+  function toggleTourPause() {
+    if (!tourActive) return;
+    if (tourPaused) { tour.resume(); tourPaused = false; }
+    else { tour.pause(); tourPaused = true; }
+  }
+
+  // Exported for the App-header Virtual Tour button: start (cinematic launch from
+  // the overview, or straight away if already walking) or stop the tour.
+  export function toggleTour() {
+    if (tourActive) stopTour();
+    else startTourFromOverview();
+  }
+  // Keep the header button's label/active state in sync with the tour.
+  $: dispatch('tour', tourActive);
+
+  // Reconcile the scene with the current mode + shell toggle: hide the shell and
+  // relax the perspective zoom-out limit when the shell is off, and keep the floor
+  // arrows shown only in orbit mode.
+  function applyView() {
+    if (roofMesh) roofMesh.visible = showShell;
+    for (const o of roofExtras) o.visible = showShell;
+    if (controls) {
+      controls.maxDistance = showShell ? orbit.maxDistance : orbit.maxDistance * 3;
+      controls.enabled = mode === 'orbit';
+    }
+    if (arrowGroup) arrowGroup.visible = mode === 'orbit';
+  }
+
+  // Re-apply when the App-header shell toggle flips (mirrors the showStock flow).
+  $: if (scene && worldGroup) { showShell; applyView(); }
+
   // Glide the camera back to its home position/target. In walk mode this is
-  // what Exit already does (instantly), so just delegate.
-  function resetView() {
+  // what Exit already does (instantly), so just delegate. Exported for the
+  // App-header Reset button.
+  export function resetView() {
     aislePickerOpen = false;
     if (mode === 'walk') { exitWalk(); return; }
     const fromPos = perspectiveCamera.position.clone();
@@ -919,12 +1136,22 @@
     };
   }
 
+  // Staged exit for the three view levels: tour → walkway → overview. Esc and the
+  // Exit button back out exactly one level — from the virtual tour they drop to
+  // the walkway right where the camera is; from the walkway they pop out to the
+  // overview. (exitWalk itself still ends a tour first, for the resetView path.)
+  function exitOneLevel() {
+    aislePickerOpen = false;
+    if (tourActive) stopTour();        // tour → walkway, held at the current spot
+    else if (mode === 'walk') exitWalk(); // walkway → overview
+  }
+
   function exitWalk() {
     aislePickerOpen = false;
+    stopTour();
     mode = 'orbit';
     clearHighlight(); // drop the walk-style (depth-tested) highlight so it rebuilds for orbit
     rail.disable();
-    if (arrowGroup) arrowGroup.visible = true;
     setRackOpacity(false);
     controls.enabled = true;
     perspectiveCamera.fov = camera.fov ?? 50;    // restore orbit FOV
@@ -934,13 +1161,20 @@
     controls.target.set(...orbit.target);
     controls.target.y *= vScale; controls.target.z *= hScale;
     controls.update();
+    applyView(); // re-enable orbit controls + arrows, reconcile the roof toggle
   }
 
   function onResize() {
-    if (!container) return;
-    perspectiveCamera.aspect = container.clientWidth / container.clientHeight;
+    if (!container || !renderer) return;
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+    if (w === 0 || h === 0) return;
+    perspectiveCamera.aspect = w / h;
     perspectiveCamera.updateProjectionMatrix();
-    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setSize(w, h);
+    // Repaint in the same tick so the freshly resized canvas is never shown blank
+    // (otherwise the nav collapse/expand and initial load flash a blank frame).
+    if (scene) renderer.render(scene, perspectiveCamera);
   }
 
   function applyVisibility() {
@@ -961,7 +1195,7 @@
   function applyStock() {
     if (!scene || !worldGroup) return;
     if (showStock && !goodsHandle) {
-      goodsHandle = buildGoods(segments, null);
+      goodsHandle = buildGoods(segments, null, { y: vScale, z: hScale }, goodsEnv);
       worldGroup.add(goodsHandle.group);
     }
     if (goodsHandle) goodsHandle.group.visible = showStock;
@@ -1013,18 +1247,34 @@
     perspectiveCamera.position.set(...camera.position);
     perspectiveCamera.position.z *= hScale; // match the depth-stretched world
 
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    // alpha:true so the canvas is transparent until the first frame paints — the
+    // matching #dde3ea container shows through instead of an opaque white canvas,
+    // avoiding a white flash on initial load while the scene builds.
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     // Cap at 1.5: beyond that the extra pixels cost fill rate with little
     // visible gain at this scene's scale (matters most on HiDPI displays).
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
+
+    // Pre-bake a soft indoor environment (PMREM) once, used as the env map for the
+    // stock so kraft, cartons, pallet wood and stretch wrap pick up believable
+    // reflections. One-time cost; nothing extra per frame.
+    {
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      const room = new RoomEnvironment(renderer); // renderer → correct (physical) light intensity
+      goodsEnv = pmrem.fromScene(room, 0.04).texture;
+      room.dispose?.();
+      pmrem.dispose();
+    }
     if (import.meta.env.DEV) {
       (window as any).__renderer = renderer;
       (window as any).__camera = () => perspectiveCamera;
       (window as any).__controls = () => controls;
       (window as any).__scene = () => scene;
+      (window as any).__rail = () => rail;
+      (window as any).__tour = () => tour;
       (window as any).__clickArrow = (name: string) => {
         const idx = rail.aisleNames.indexOf(name);
         if (idx >= 0) { setArrowHover(null); enterWalk(idx); }
@@ -1049,11 +1299,20 @@
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
     controls.update();
-    // Grabbing the scene mid-flight hands control straight back to the user.
-    controls.addEventListener('start', () => { camTween = null; });
+    // Grabbing the scene mid-flight hands control straight back to the user
+    // (and aborts a pending tour fly-in without starting the tour).
+    controls.addEventListener('start', () => { camTween = null; tourEntering = false; });
 
     clock = new THREE.Clock();
     rail = makeRail();
+    tour = new TourController(rail, perspectiveCamera);
+    tour.onStop = () => { tourActive = false; tourPaused = false; };
+    tour.planVertical = planVerticalInspection; // per-level pitch plan for the showcase
+    tour.bayCenters = bayCentersForAisle;       // snap showcase stops onto bay centres
+    // Grabbing the controls mid-playback takes over and ends the tour. While the
+    // tour is PAUSED the user is meant to roam freely, so input is left alone —
+    // resume continues from wherever they end up.
+    rail.onUserInput = () => { if (tourActive && !tourPaused) stopTour(); };
 
     // High-bay rig: bright even hemisphere base, warm key from above, a front
     // fill aimed at the rack faces the default vantage looks at, and a faint
@@ -1069,9 +1328,6 @@
     backFill.position.set(40000, 45000, -30000);
     scene.add(backFill);
 
-    gridMesh = makeShaderGrid();
-    worldGroup.add(gridMesh);
-
     raycaster = new THREE.Raycaster();
     pointer = new THREE.Vector2();
 
@@ -1079,6 +1335,11 @@
     applyVisibility();
 
     window.addEventListener('resize', onResize);
+    // Keep the canvas matched to its container for ANY size change — not just
+    // window resizes — e.g. the nav bar collapsing/expanding animates the
+    // viewport height, which would otherwise leave a gap.
+    resizeObserver = new ResizeObserver(() => onResize());
+    resizeObserver.observe(container);
     window.addEventListener('keydown', onWindowKeydown);
     window.addEventListener('keyup', onWindowKeyup);
     canvas.addEventListener('pointermove', onPointerMove);
@@ -1127,6 +1388,26 @@
     spaceSegments = buckets.get('SPACE') ?? [];
     for (const s of segments) rackTopY = Math.max(rackTopY, s.coordinateZ + s.dimensionZ);
 
+    // Index levels and group each level's storage locations, for the tour's
+    // level-showcase highlight + locations panel.
+    for (const lv of buckets.get('LEVEL') ?? []) {
+      levelByName.set(lv.fullName, lv);
+      const bay = bayNameOf(lv.fullName);
+      (levelsByBay.get(bay) ?? levelsByBay.set(bay, []).get(bay)!).push(lv);
+    }
+    // Each bay's shelves bottom-to-top, for stepping the tour through every level.
+    for (const list of levelsByBay.values()) list.sort((a, b) => a.coordinateZ - b.coordinateZ);
+    for (const sp of spaceSegments) {
+      const lvl = levelNameOf(sp.fullName);
+      (spacesByLevel.get(lvl) ?? spacesByLevel.set(lvl, []).get(lvl)!).push(sp);
+    }
+    // Order each level's locations by code (A25A01, A25A02, …) for the panel table.
+    for (const list of spacesByLevel.values()) list.sort((a, b) => a.fullName.localeCompare(b.fullName));
+    for (const b of buckets.get('BAY') ?? []) {
+      const letter = aisleLetterOf(b.fullName);
+      (bayXsByAisle.get(letter) ?? bayXsByAisle.set(letter, []).get(letter)!).push(b.coordinateX + b.dimensionX / 2);
+    }
+
     // Realistic warehouse layer: upright frames, beams, signs, floor, shell.
     // Always visible and opaque; the tier boxes above act as optional overlays.
     const rows = groupBaysIntoRows(segments);
@@ -1134,9 +1415,17 @@
     const signs = buildAisleSigns(segments, rows);
     racks.group.add(signs.group);
     worldGroup.add(racks.group);
-    const env = buildEnvironment(segments, rows);
+    const env = buildEnvironment(segments, rows, goodsEnv);
     worldGroup.add(env.group);
     shellBounds = env.shell;
+    roofMesh = env.roof;
+    // Structure that hides alongside the roof for a clean open overview: the
+    // cladding walls, the steel columns and rafters, and the hanging lights —
+    // everything but the floor, racks and aisle markings.
+    roofExtras = ['SHELL_WALLS', 'SHELL_COLUMNS', 'SHELL_RAFTERS', 'LIGHT_FIXTURES', 'LIGHT_RODS']
+      .map((n) => env.group.getObjectByName(n))
+      .filter((o): o is THREE.Object3D => !!o);
+    applyView(); // keep the roof toggle state across rebuilds
     // const loads = buildPallets(spaceSegments);
     // worldGroup.add(loads.group);
     const nets = buildSafetyNets(rows);
@@ -1148,6 +1437,7 @@
   function animate() {
     rafId = requestAnimationFrame(animate);
     const dt = clock ? clock.getDelta() : 0;
+    updateHighlightFade(dt); // smooth hover fade in/out, runs in every mode
     if (mode === 'orbit') {
       stepCamTween();
       applyOrbitPan(dt);
@@ -1156,7 +1446,10 @@
       // shell regardless of rotation, zoom, or arrow-key panning.
       const p = perspectiveCamera.position;
       if (p.y < floorY) p.y = floorY;
-      if (shellBounds) {
+      // With the shell hidden the building is open (its walls/roof are one-sided
+      // and cull from outside), so drop the cage entirely and let the camera fly
+      // up and out for a full overview — only the floor holds.
+      if (shellBounds && showShell) {
         const PAD = 1500;
         const minX = shellBounds.minX + PAD;
         const maxX = shellBounds.maxX - PAD;
@@ -1172,14 +1465,26 @@
         tg.z = Math.min(Math.max(tg.z, minZ), maxZ);
       }
     } else {
-      rail.update(dt);
-      updateHover();
-    }
-    if (gridMesh) {
-      const u = (gridMesh.material as THREE.ShaderMaterial).uniforms.uCameraPos.value as THREE.Vector3;
-      u.copy(perspectiveCamera.position);
+      // The tour drives the rail itself (and steers directly during aisle
+      // turns), so only one of the two runs per frame. Cursor hover is
+      // suppressed while touring — the camera moves under a stationary cursor,
+      // so racks would otherwise flash highlighted as they slide past.
+      if (tourActive && !tourPaused) {
+        tour.update(dt * tourSpeed); // playback-speed scaled time-step
+        updateTourHover();
+      } else {
+        // Not touring, or paused mid-tour: the rail takes manual input. While
+        // paused, hover surfaces the level banner; otherwise the usual tooltip.
+        rail.update(dt);
+        if (tourPaused) updatePausedHover();
+        else updateHover();
+      }
     }
     renderer.render(scene, perspectiveCamera);
+    if (!firstRendered) {
+      firstRendered = true;
+      dispatch('ready'); // scene is on screen — the loading overlay can fade out
+    }
   }
 
   onMount(() => {
@@ -1189,16 +1494,22 @@
   onDestroy(() => {
     cancelAnimationFrame(rafId);
     window.removeEventListener('resize', onResize);
+    resizeObserver?.disconnect();
     window.removeEventListener('keydown', onWindowKeydown);
     window.removeEventListener('keyup', onWindowKeyup);
+    if (tour) tour.dispose();
     if (rail) rail.dispose();
     if (canvas) {
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerleave', onPointerLeave);
     }
     for (const dispose of realisticDisposers) dispose();
+    if (highlightGroup) disposeHighlightGroup(highlightGroup);
+    for (const g of fadingHighlights) disposeHighlightGroup(g);
     if (goodsHandle) goodsHandle.dispose();
     disposeGoodsTextures();
+    goodsEnv?.dispose();
+    if (controls) controls.dispose();
     if (renderer) renderer.dispose();
   });
 </script>
@@ -1206,80 +1517,135 @@
 <div class="scene-container" bind:this={container}>
   <canvas bind:this={canvas} on:pointerdown={onCanvasPointerDown} on:click={onCanvasClick}></canvas>
   {#if hoverInfo}
-    <div class="tooltip" style="left: {tooltipX + 14}px; top: {tooltipY + 14}px;">
-      <strong>{hoverInfo.fullName}</strong> ({hoverInfo.type})
-      <br />
-      coord: ({hoverInfo.coords[0]}, {hoverInfo.coords[1]}, {hoverInfo.coords[2]})
-      <br />
-      dim:&nbsp;&nbsp; ({hoverInfo.dims[0]} × {hoverInfo.dims[1]} × {hoverInfo.dims[2]})
+    <div
+      class="loc-banner"
+      style="left: {tooltipX + 16}px; top: {tooltipY + 16}px;"
+      transition:fade={{ duration: 140 }}
+    >
+      <div class="loc-name">{hoverInfo.fullName}</div>
+      <div class="loc-type">{hoverInfo.type}</div>
+      <div class="loc-dims">
+        <div class="dim"><span class="dim-axis">Width</span><span class="dim-val">{toMetres(hoverInfo.dims[0])}<span class="dim-u">m</span></span></div>
+        <div class="dim"><span class="dim-axis">Depth</span><span class="dim-val">{toMetres(hoverInfo.dims[1])}<span class="dim-u">m</span></span></div>
+        <div class="dim"><span class="dim-axis">Height</span><span class="dim-val">{toMetres(hoverInfo.dims[2])}<span class="dim-u">m</span></span></div>
+      </div>
+      <div class="loc-pos">
+        <span class="loc-label">POS</span>{toMetres(hoverInfo.coords[0])}, {toMetres(hoverInfo.coords[1])}, {toMetres(hoverInfo.coords[2])}<span class="loc-unit">m</span>
+      </div>
     </div>
   {/if}
-  <div class="find-ui">
-    <div class="find-bar">
-      <svg class="find-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
-        <circle cx="11" cy="11" r="7" />
-        <line x1="16.5" y1="16.5" x2="21" y2="21" />
-      </svg>
-      <input
-        class="find-input" type="text" placeholder="Search location… e.g. N11G03 or A25"
-        bind:this={findInputEl}
-        bind:value={findQuery}
-        on:input={updateSuggestions}
-        on:keydown={onFindKeydown}
-        on:focus={() => { if (suggestions.length) suggestionsOpen = true; }}
-        on:blur={() => setTimeout(() => { suggestionsOpen = false; }, 120)}
-        spellcheck="false" autocomplete="off"
-      />
-      {#if findQuery}
-        <button class="find-clear" on:click={clearSearch} title="Clear search">✕</button>
-      {:else}
-        <kbd class="find-kbd">/</kbd>
-      {/if}
-      <button class="find-btn" on:click={() => findLocation()}>Find</button>
+
+  {#if tourActive && tourLevelInfo}
+    {@const lvl = tourLevelInfo.levelSeg}
+    {@const n = tourLevelInfo.spaces.length}
+    <div class="level-panel" transition:fade={{ duration: 180 }}>
+      <div class="lp-head">
+        <span class="lp-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="16" rx="1.5" /><path d="M3 10h18M3 15h18" />
+          </svg>
+        </span>
+        <div class="lp-title">
+          <span class="lp-label">Rack Level</span>
+          <span class="lp-name">{tourLevelInfo.level}</span>
+        </div>
+        <span class="lp-ctx">Aisle {aisleLetterOf(tourLevelInfo.level)} · Bay {bayNameOf(tourLevelInfo.level)}</span>
+        <span class="lp-count">{n} location{n === 1 ? '' : 's'}</span>
+      </div>
+
+      <!-- Level summary: the requested level dimensions + coordinates, plus a few
+           geometry-derived figures that help a client read the layout at a glance. -->
+      <div class="lp-stats">
+        <div class="lp-stat">
+          <svg class="lp-sico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2.5 21 7v10l-9 4.5L3 17V7z" /><path d="M3 7l9 4.5L21 7M12 11.5V21" /></svg>
+          <div class="lp-sbody">
+            <span class="lp-sk">Dimensions <i>W × D × H</i></span>
+            <span class="lp-sv">{toMetres(lvl.dimensionX)} × {toMetres(lvl.dimensionY)} × {toMetres(lvl.dimensionZ)} <u>m</u></span>
+          </div>
+        </div>
+        <div class="lp-stat">
+          <svg class="lp-sico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M3 12h18" /><circle cx="12" cy="12" r="2.4" /></svg>
+          <div class="lp-sbody">
+            <span class="lp-sk">Coordinates</span>
+            <span class="lp-sv lp-coord">
+              <span class="lp-ax">X</span>{toMetres(lvl.coordinateX)}
+              <span class="lp-ax">Y</span>{toMetres(lvl.coordinateY)}
+              <span class="lp-ax">Z</span>{toMetres(lvl.coordinateZ)} <u>m</u>
+            </span>
+          </div>
+        </div>
+        <div class="lp-stat">
+          <svg class="lp-sico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v13M7 9l5-5 5 5M5 21h14" /></svg>
+          <div class="lp-sbody">
+            <span class="lp-sk">Elevation</span>
+            <span class="lp-sv">{toMetres(lvl.coordinateZ)} <u>m</u></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Per-location breakdown: code, dimensions and coordinates for every
+           storage position on the shelf. Scrolls if a level is unusually wide. -->
+      <div class="lp-loc">
+        <div class="lp-loc-row lp-loc-head">
+          <span>Location</span>
+          <span>Dimensions <i>m</i></span>
+          <span>Coordinates <i>X · Y · Z, m</i></span>
+        </div>
+        <div class="lp-loc-body">
+          {#each tourLevelInfo.spaces as s (s.fullName)}
+            <div class="lp-loc-row">
+              <span class="lp-code">{s.fullName}</span>
+              <span class="lp-celldim">{toMetres(s.dimensionX)} × {toMetres(s.dimensionY)} × {toMetres(s.dimensionZ)}</span>
+              <span class="lp-cellxyz">{toMetres(s.coordinateX)} · {toMetres(s.coordinateY)} · {toMetres(s.coordinateZ)}</span>
+            </div>
+          {/each}
+        </div>
+      </div>
     </div>
+  {/if}
 
-    {#if suggestionsOpen}
-      <ul class="find-suggestions">
-        {#each suggestions as s, i}
-          <li>
-            <button
-              class="suggestion" class:active={i === activeSuggestion}
-              on:mousedown|preventDefault={() => findLocation(s.fullName)}
-              on:mouseenter={() => (activeSuggestion = i)}
-            >
-              <span class="s-name"><strong>{s.fullName.slice(0, qLen)}</strong>{s.fullName.slice(qLen)}</span>
-              <span class="s-type" style="--t: {TYPE_HEX[s.type]}">{s.type}</span>
-            </button>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-
-    {#if findStatus}
-      <div class="find-status" class:err={findStatusKind === 'err'}>
-        {findStatus}
+  {#if mode === 'walk'}
+    <div class="aisle-badge" class:touring={tourActive} class:paused={tourPaused} transition:fade={{ duration: 160 }}>
+      <div class="ab-head">
+        <span class="ab-label">Aisle</span>
+        {#if tourActive}<span class="ab-tour"><span class="ab-dot"></span>{tourPaused ? 'Paused' : 'Tour'}</span>{/if}
       </div>
-    {/if}
-  </div>
+      {#key aisleLabel}
+        <div class="ab-letter" in:scale={{ duration: 220, start: 0.7 }}>{aisleLabel || '—'}</div>
+      {/key}
+      <div class="ab-count">{aisleIndex + 1}<span class="ab-sep">/</span>{aisleTotal}</div>
+    </div>
+  {/if}
+
   <div class="nav-ui">
-    {#if mode === 'orbit'}
-      <div class="nav-row">
-      <button class="nav-btn home-btn" on:click={resetView} title="Reset view">
-        <svg class="home-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 10.5 L12 3 L21 10.5" />
-          <path d="M5.5 9.2 V20 H18.5 V9.2" />
-        </svg>
-      </button>
-      </div>
-    {:else}
+    {#if mode === 'walk'}
       <div class="walk-bar">
-        <button class="walk-exit" on:click={exitWalk} title="Exit walk mode">✕ Exit</button>
-        <button class="walk-arrow" on:click={() => rail.prevAisle()} title="Previous aisle">‹</button>
+        <button
+          class="walk-exit" on:click={exitOneLevel}
+          title={tourActive ? 'Exit the tour — back to the walkway' : 'Exit the walkway — back to the overview'}
+        >
+          {tourActive ? '✕ Exit tour' : '✕ Exit'}
+        </button>
+        {#if tourActive}
+          <button
+            class="walk-tour on" class:paused={tourPaused}
+            on:click={toggleTourPause}
+            title={tourPaused ? 'Resume virtual tour' : 'Pause virtual tour'}
+          >
+            {tourPaused ? '▶ Resume' : '❚❚ Pause'}
+          </button>
+          <button class="tour-speed" class:open={tourSpeedOpen}
+            on:click={() => (tourSpeedOpen = !tourSpeedOpen)} title="Tour speed">
+            {tourSpeed}×
+            <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6" /></svg>
+          </button>
+        {/if}
+        <button class="walk-arrow" on:click={() => { stopTour(); rail.prevAisle(); }} title="Previous aisle">‹</button>
         <button class="aisle-current" on:click={() => (aislePickerOpen = !aislePickerOpen)} title="Choose aisle">
           {aisleLabel} <span class="muted">{aisleIndex + 1}/{aisleTotal}</span>
           <svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6" /></svg>
         </button>
-        <button class="walk-arrow" on:click={() => rail.nextAisle()} title="Next aisle">›</button>
+        <button class="walk-arrow" on:click={() => { stopTour(); rail.nextAisle(); }} title="Next aisle">›</button>
       </div>
     {/if}
 
@@ -1292,7 +1658,7 @@
               <button
                 class="aisle-item"
                 class:current={i === aisleIndex}
-                on:click={() => { rail.setAisle(i); aislePickerOpen = false; }}
+                on:click={() => { stopTour(); rail.setAisle(i); aislePickerOpen = false; }}
               >
                 <span class="dot"></span>{name}
                 {#if i === aisleIndex}<span class="here">current</span>{/if}
@@ -1302,9 +1668,27 @@
         </ul>
       </div>
     {/if}
+
+    {#if tourSpeedOpen && tourActive}
+      <div class="speed-picker">
+        <div class="picker-title">Tour speed</div>
+        <div class="speed-row">
+          {#each TOUR_SPEEDS as s}
+            <button class="speed-item" class:current={s === tourSpeed}
+              on:click={() => { tourSpeed = s; tourSpeedOpen = false; }}>
+              {s}×
+            </button>
+          {/each}
+        </div>
+      </div>
+    {/if}
   </div>
   {#if mode === 'walk'}
-    <div class="walk-hint">drag to look · W/S move · A/D turn · Q/E up·down · ←/→ aisle · Esc exit</div>
+    <div class="walk-hint">
+      {#if tourActive && tourPaused}paused · move/look to inspect stock · hover a rack for its level · Space or Resume to continue · Esc → walkway
+      {:else if tourActive}touring · Space to pause · drag or any key to take over · Esc → walkway
+      {:else}drag to look · W/S move · A/D turn · Q/E up·down · ←/→ aisle · ▶ Tour · Esc → overview{/if}
+    </div>
   {:else}
     <div class="walk-hint">drag to orbit · scroll to zoom · ↑/↓ move · ←/→ strafe</div>
   {/if}
@@ -1322,118 +1706,249 @@
     width: 100%;
     height: 100%;
   }
-  .tooltip {
+  .aisle-badge {
     position: absolute;
-    background: rgba(0, 0, 0, 0.85);
-    color: white;
-    padding: 6px 10px;
-    border-radius: 4px;
-    font-size: 12px;
-    white-space: nowrap;
-    pointer-events: none;
-    font-family: monospace;
+    top: 14px;
+    left: 14px;
     z-index: 10;
-  }
-  .find-ui {
-    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
-    z-index: 10; display: flex; flex-direction: column; align-items: center; gap: 8px;
-    width: min(440px, calc(100% - 32px));
-  }
-  .find-bar {
-    display: flex; align-items: center; gap: 9px; width: 100%;
+    pointer-events: none;
+    min-width: 78px;
+    padding: 10px 14px 11px;
+    text-align: center;
+    color: #e2e8f0;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
     background: rgba(11, 18, 32, 0.88);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
     border: 1.5px solid #334155;
-    border-radius: 999px;
-    padding: 6px 6px 6px 15px;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
-    transition: border-color 0.15s, box-shadow 0.15s;
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    transition: border-color 0.25s;
   }
-  .find-bar:focus-within {
-    border-color: #3b82f6;
-    box-shadow: 0 4px 28px rgba(59, 130, 246, 0.28);
+  .aisle-badge.touring { border-color: rgba(56, 189, 248, 0.55); }
+  .aisle-badge.touring.paused { border-color: rgba(245, 158, 11, 0.6); }
+  .ab-head {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
   }
-  .find-icon { width: 15px; height: 15px; color: #64748b; flex: none; transition: color 0.15s; }
-  .find-bar:focus-within .find-icon { color: #3b82f6; }
-  .find-input {
-    flex: 1; min-width: 0; background: transparent; border: none; outline: none;
-    color: #e2e8f0; font-size: 13px; font-family: monospace; letter-spacing: 0.3px;
+  .ab-label {
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: #94a3b8;
   }
-  .find-input::placeholder { color: #475569; }
-  .find-clear {
-    flex: none; width: 22px; height: 22px; border-radius: 50%;
-    border: none; background: #1e293b; color: #94a3b8; cursor: pointer;
-    font-size: 11px; line-height: 1; display: grid; place-items: center;
-    transition: background 0.15s, color 0.15s;
+  .ab-tour {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    color: #38bdf8;
   }
-  .find-clear:hover { background: #334155; color: #e2e8f0; }
-  .find-kbd {
-    flex: none; color: #475569; border: 1px solid #334155; border-radius: 4px;
-    font-size: 10px; font-family: monospace; padding: 1px 6px;
+  .ab-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #38bdf8;
+    animation: ab-pulse 1.4s ease-in-out infinite;
   }
-  .find-btn {
-    flex: none; background: #2563eb; border: none; color: #fff;
-    padding: 6px 18px; border-radius: 999px; cursor: pointer;
-    font-size: 12px; font-weight: 600; letter-spacing: 0.3px;
-    transition: background 0.15s;
+  @keyframes ab-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+  /* Paused: amber, steady (no pulse) — a held frame, not active motion. */
+  .aisle-badge.paused .ab-tour { color: #fbbf24; }
+  .aisle-badge.paused .ab-dot { background: #fbbf24; animation: none; }
+  .ab-letter {
+    font-size: 34px;
+    font-weight: 700;
+    line-height: 1.05;
+    color: #f8fafc;
+    margin-top: 2px;
   }
-  .find-btn:hover { background: #3b82f6; }
-  .find-btn:active { background: #1d4ed8; }
-  .find-suggestions {
-    width: 100%; margin: 0; padding: 6px; list-style: none;
-    background: rgba(11, 18, 32, 0.95);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border: 1px solid #334155; border-radius: 14px;
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
-    max-height: 280px; overflow-y: auto;
+  .ab-count {
+    margin-top: 3px;
+    font-size: 11px;
+    color: #94a3b8;
   }
-  .find-suggestions li { margin: 0; padding: 0; }
-  .suggestion {
-    width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 12px;
-    background: transparent; border: none; cursor: pointer;
-    padding: 8px 11px; border-radius: 9px; color: #cbd5e1;
-    font-family: monospace; font-size: 12px; text-align: left;
-    transition: background 0.1s;
+  .ab-sep { color: #475569; margin: 0 4px; }
+  .loc-banner {
+    position: absolute;
+    z-index: 10;
+    pointer-events: none;
+    min-width: 156px;
+    padding: 13px 18px 14px;
+    text-align: center;
+    color: #e2e8f0;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    background: rgba(11, 18, 32, 0.9);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border: 1.5px solid #334155;
+    border-radius: 14px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.05);
   }
-  .suggestion.active { background: rgba(59, 130, 246, 0.16); color: #e2e8f0; }
-  .s-name strong { color: #60a5fa; font-weight: 700; }
-  .s-type {
-    flex: none; font-size: 9px; padding: 2px 8px; border-radius: 999px;
-    border: 1px solid var(--t); color: var(--t); letter-spacing: 0.6px;
+
+  /* Tour level showcase: floating panel detailing the inspected shelf — a
+     summary header, level-summary stat strip, and a per-location table. */
+  .level-panel {
+    position: absolute;
+    left: 50%;
+    bottom: 64px;
+    transform: translateX(-50%);
+    z-index: 11;
+    pointer-events: none;
+    width: min(720px, calc(100% - 40px));
+    color: #e2e8f0;
+    font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(9, 14, 26, 0.94));
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1.5px solid #334155;
+    border-radius: 16px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+    overflow: hidden;
   }
-  .find-status {
-    font-size: 11px; font-family: monospace; white-space: nowrap;
-    padding: 4px 13px; border-radius: 999px;
-    background: rgba(34, 197, 94, 0.12); color: #4ade80;
-    border: 1px solid rgba(34, 197, 94, 0.35);
+
+  /* Header band */
+  .lp-head {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 16px;
+    background: linear-gradient(90deg, rgba(56, 189, 248, 0.12), rgba(56, 189, 248, 0));
+    border-bottom: 1px solid rgba(148, 163, 184, 0.16);
   }
-  .find-status.err {
-    background: rgba(239, 68, 68, 0.12); color: #f87171;
-    border-color: rgba(239, 68, 68, 0.35);
+  .lp-badge {
+    flex: none; display: grid; place-items: center;
+    width: 34px; height: 34px; border-radius: 9px;
+    color: #38bdf8;
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.35);
   }
+  .lp-badge svg { width: 19px; height: 19px; }
+  .lp-title { display: flex; flex-direction: column; gap: 1px; }
+  .lp-label {
+    font-size: 9.5px; font-weight: 600; letter-spacing: 1.6px;
+    text-transform: uppercase; color: #64748b;
+  }
+  .lp-name { font-size: 20px; font-weight: 700; letter-spacing: 0.6px; color: #f8fafc; line-height: 1; }
+  .lp-ctx {
+    margin-left: auto;
+    font-size: 11px; letter-spacing: 0.3px; color: #94a3b8;
+  }
+  .lp-count {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.3px; color: #38bdf8;
+    padding: 4px 10px; border-radius: 999px;
+    background: rgba(56, 189, 248, 0.1);
+    border: 1px solid rgba(56, 189, 248, 0.32);
+  }
+
+  /* Level-summary stat strip */
+  .lp-stats {
+    display: flex; flex-wrap: wrap;
+    padding: 11px 8px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  }
+  .lp-stat {
+    display: flex; align-items: center; gap: 9px;
+    flex: 1 1 auto; min-width: 0;
+    padding: 3px 12px;
+  }
+  .lp-stat + .lp-stat { border-left: 1px solid rgba(148, 163, 184, 0.12); }
+  .lp-sico { width: 17px; height: 17px; flex: none; color: #38bdf8; opacity: 0.95; }
+  .lp-sbody { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .lp-sk {
+    font-size: 9px; font-weight: 600; letter-spacing: 0.9px;
+    text-transform: uppercase; color: #64748b; white-space: nowrap;
+  }
+  .lp-sk i { font-style: normal; color: #475569; letter-spacing: 0.4px; }
+  .lp-sv { font-size: 13.5px; font-weight: 600; color: #f1f5f9; white-space: nowrap; }
+  .lp-sv u { text-decoration: none; margin-left: 2px; font-size: 10px; color: #38bdf8; }
+  .lp-coord { display: inline-flex; align-items: baseline; gap: 4px; }
+  .lp-ax {
+    font-size: 8.5px; font-weight: 700; letter-spacing: 0.4px; color: #64748b;
+    padding: 0 1px;
+  }
+  .lp-ax:not(:first-child) { margin-left: 4px; }
+
+  /* Per-location table */
+  .lp-loc { padding: 4px 6px 8px; }
+  .lp-loc-row {
+    display: grid;
+    grid-template-columns: minmax(86px, 1fr) minmax(150px, 1.3fr) minmax(150px, 1.3fr);
+    align-items: center;
+    gap: 10px;
+    padding: 6px 12px;
+    border-radius: 8px;
+  }
+  .lp-loc-head span {
+    font-size: 9px; font-weight: 600; letter-spacing: 1px;
+    text-transform: uppercase; color: #64748b;
+  }
+  .lp-loc-head i { font-style: normal; color: #475569; letter-spacing: 0.4px; }
+  .lp-loc-body { display: flex; flex-direction: column; gap: 2px; max-height: 168px; overflow-y: auto; }
+  .lp-loc-body .lp-loc-row:nth-child(odd) { background: rgba(148, 163, 184, 0.05); }
+  .lp-code {
+    font-size: 13px; font-weight: 700; letter-spacing: 0.5px; color: #38bdf8;
+  }
+  .lp-celldim, .lp-cellxyz { font-size: 12px; color: #cbd5e1; white-space: nowrap; }
+  .lp-cellxyz { color: #94a3b8; }
+  .lp-loc-body::-webkit-scrollbar { width: 6px; }
+  .lp-loc-body::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.3); border-radius: 3px; }
+
+  .loc-name {
+    font-size: 26px;
+    font-weight: 700;
+    line-height: 1.05;
+    letter-spacing: 0.5px;
+    color: #f8fafc;
+  }
+  .loc-type {
+    margin-top: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.6px;
+    text-transform: uppercase;
+    color: #38bdf8;
+  }
+  /* Dimensions: the hero metric — three labelled columns (spelled out for any
+     audience), each value in metres with the unit. */
+  .loc-dims {
+    margin-top: 11px;
+    padding-top: 10px;
+    border-top: 1px solid rgba(148, 163, 184, 0.18);
+    display: flex;
+    justify-content: center;
+    gap: 16px;
+    white-space: nowrap;
+  }
+  .dim { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+  .dim-axis {
+    font-size: 9px; font-weight: 600; letter-spacing: 0.8px;
+    text-transform: uppercase; color: #64748b;
+  }
+  .dim-val { font-size: 15px; font-weight: 600; color: #f1f5f9; }
+  .dim-u { margin-left: 2px; font-size: 10px; font-weight: 600; color: #38bdf8; }
+  /* Position: secondary line, also in metres. */
+  .loc-pos {
+    margin-top: 6px;
+    font-size: 11px;
+    color: #94a3b8;
+    white-space: nowrap;
+  }
+  .loc-label {
+    margin-right: 7px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    color: #64748b;
+  }
+  .loc-unit { margin-left: 5px; color: #64748b; }
   .nav-ui {
     position: absolute; top: 14px; right: 14px; z-index: 10;
     display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
   }
-  .nav-btn {
-    background: rgba(11, 18, 32, 0.88);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
-    border: 1.5px solid #334155; color: #e2e8f0;
-    padding: 6px 14px; border-radius: 999px; cursor: pointer;
-    font-size: 12px; font-family: monospace; transition: border-color 0.15s;
-  }
-  .nav-btn:hover { border-color: #3b82f6; }
-  .nav-row { display: flex; align-items: stretch; gap: 8px; }
-  .home-btn {
-    display: inline-flex; align-items: center; padding: 9px 12px;
-    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45);
-  }
-  .home-btn:hover { background: rgba(30, 41, 59, 0.88); }
-  .home-icon { width: 16px; height: 16px; color: #94a3b8; }
-  .home-btn:hover .home-icon { color: #e2e8f0; }
   .chev { width: 13px; height: 13px; color: #64748b; flex: none; transition: transform 0.15s; }
   .walk-bar {
     display: flex; align-items: center; gap: 5px;
@@ -1450,6 +1965,21 @@
     font-size: 12px; font-family: monospace; transition: background 0.15s;
   }
   .walk-exit:hover { background: rgba(239, 68, 68, 0.25); }
+  .walk-tour {
+    background: rgba(59, 130, 246, 0.14); border: 1px solid rgba(59, 130, 246, 0.4);
+    color: #93c5fd; padding: 6px 14px; border-radius: 999px; cursor: pointer;
+    font-size: 12px; font-family: monospace; transition: background 0.15s, color 0.15s;
+  }
+  .walk-tour:hover { background: rgba(59, 130, 246, 0.26); }
+  .walk-tour.on {
+    background: #2563eb; border-color: #2563eb; color: #fff;
+  }
+  .walk-tour.on:hover { background: #3b82f6; }
+  /* Paused: amber so the frozen state reads at a glance during a demo. */
+  .walk-tour.on.paused {
+    background: rgba(245, 158, 11, 0.16); border-color: rgba(245, 158, 11, 0.5); color: #fbbf24;
+  }
+  .walk-tour.on.paused:hover { background: rgba(245, 158, 11, 0.28); }
   .walk-arrow {
     background: transparent; border: none; color: #94a3b8; cursor: pointer;
     width: 28px; height: 28px; border-radius: 50%; font-size: 17px; line-height: 1;
@@ -1464,6 +1994,33 @@
   }
   .aisle-current:hover { background: #1e293b; }
   .muted { opacity: 0.55; }
+  .tour-speed {
+    display: inline-flex; align-items: center; gap: 3px;
+    background: rgba(59, 130, 246, 0.14); border: 1px solid rgba(59, 130, 246, 0.4);
+    color: #93c5fd; cursor: pointer;
+    font-size: 12px; font-family: monospace; padding: 6px 8px 6px 11px; border-radius: 999px;
+    transition: background 0.15s, color 0.15s;
+  }
+  .tour-speed:hover, .tour-speed.open { background: rgba(59, 130, 246, 0.26); color: #dbeafe; }
+  .tour-speed .chev { width: 12px; height: 12px; color: currentColor; }
+  .speed-picker {
+    padding: 6px;
+    background: rgba(11, 18, 32, 0.95);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid #334155; border-radius: 14px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  }
+  .speed-row { display: flex; flex-wrap: wrap; gap: 5px; max-width: 184px; }
+  .speed-item {
+    background: transparent; border: 1px solid transparent; cursor: pointer;
+    color: #cbd5e1; font-family: monospace; font-size: 12px;
+    padding: 6px 10px; border-radius: 8px; transition: background 0.1s, color 0.1s;
+  }
+  .speed-item:hover { background: rgba(59, 130, 246, 0.16); color: #e2e8f0; }
+  .speed-item.current {
+    color: #fff; background: #2563eb; border-color: #2563eb;
+  }
   .aisle-picker {
     width: 210px; padding: 6px;
     background: rgba(11, 18, 32, 0.95);
@@ -1498,24 +2055,18 @@
   }
   /* Themed scrollbars for the dropdown panels (default white track clashes
      with the dark UI). */
-  .aisle-picker,
-  .find-suggestions {
+  .aisle-picker {
     scrollbar-width: thin;                      /* Firefox */
     scrollbar-color: #334155 transparent;
   }
-  .aisle-picker::-webkit-scrollbar,
-  .find-suggestions::-webkit-scrollbar { width: 8px; }
-  .aisle-picker::-webkit-scrollbar-track,
-  .find-suggestions::-webkit-scrollbar-track { background: transparent; }
-  .aisle-picker::-webkit-scrollbar-button,
-  .find-suggestions::-webkit-scrollbar-button { display: none; height: 0; }
-  .aisle-picker::-webkit-scrollbar-thumb,
-  .find-suggestions::-webkit-scrollbar-thumb {
+  .aisle-picker::-webkit-scrollbar { width: 8px; }
+  .aisle-picker::-webkit-scrollbar-track { background: transparent; }
+  .aisle-picker::-webkit-scrollbar-button { display: none; height: 0; }
+  .aisle-picker::-webkit-scrollbar-thumb {
     background: #334155; border-radius: 999px;
     border: 2px solid transparent; background-clip: padding-box;
   }
-  .aisle-picker::-webkit-scrollbar-thumb:hover,
-  .find-suggestions::-webkit-scrollbar-thumb:hover {
+  .aisle-picker::-webkit-scrollbar-thumb:hover {
     background: #475569; background-clip: padding-box; border: 2px solid transparent;
   }
   .walk-hint {

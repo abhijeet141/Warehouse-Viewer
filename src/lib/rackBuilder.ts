@@ -111,6 +111,27 @@ export function buildRacks(
   const frames = computeFrames(rows);
   const levels = segments.filter((s) => s.type === 'LEVEL');
 
+  // Top-level design change: the topmost level is open from the top. For each
+  // rack stack we find the highest LEVEL so we can (a) skip its upper beam and
+  // (b) cut the uprights down. "Top shelf" = that top level's coordinateZ (the
+  // beam it rests on); the posts/frame are trimmed to about half their height
+  // above that shelf instead of running to the full bay height.
+  const topZByFootprint = new Map<string, number>();
+  const topShelfZByY = new Map<number, number>();
+  for (const lv of levels) {
+    const fk = `${lv.coordinateX}|${lv.coordinateY}`;
+    const fPrev = topZByFootprint.get(fk);
+    if (fPrev === undefined || lv.coordinateZ > fPrev) topZByFootprint.set(fk, lv.coordinateZ);
+    const yPrev = topShelfZByY.get(lv.coordinateY);
+    if (yPrev === undefined || lv.coordinateZ > yPrev) topShelfZByY.set(lv.coordinateY, lv.coordinateZ);
+  }
+  // Trimmed upright height per frame: halfway between the top shelf and the old
+  // full height. Frames with no levels (shouldn't happen) keep their height.
+  const frameTops = frames.map((f) => {
+    const shelf = topShelfZByY.get(f.y);
+    return shelf === undefined ? f.height : shelf + (f.height - shelf) / 2;
+  });
+
   function makeInst(count: number, mat: THREE.Material, name: string): THREE.InstancedMesh {
     const inst = new THREE.InstancedMesh(unitBox, mat, count);
     inst.name = name;
@@ -140,16 +161,19 @@ export function buildRacks(
     'RACK_POSTS',
   );
   let pi = 0;
-  for (const f of frames) {
+  frames.forEach((f, idx) => {
+    const top = frameTops[idx]; // trimmed: posts stop above the top level, not the full bay height
     for (const zOff of [RACK.POST / 2, f.depth - RACK.POST / 2]) {
-      setBox(posts, pi++, f.x + RACK.POST / 2, f.height / 2, f.y + zOff, RACK.POST, f.height, RACK.POST);
+      setBox(posts, pi++, f.x + RACK.POST / 2, top / 2, f.y + zOff, RACK.POST, top, RACK.POST);
     }
-  }
+  });
 
   // Frame bracing: horizontal member at each panel bottom plus the frame top,
   // one diagonal per panel alternating direction (zig-zag), all spanning the
   // clear depth between post centres.
-  const framePanels = frames.map((f) => Math.max(1, Math.round(f.height / RACK.BRACE_PANEL)));
+  // Bracing rises with the (now trimmed) upright frame, so it never floats above
+  // the shortened posts.
+  const framePanels = frames.map((_, idx) => Math.max(1, Math.round(frameTops[idx] / RACK.BRACE_PANEL)));
   let braceCount = 0;
   for (const n of framePanels) braceCount += 2 * n + 1;
   const braces = makeInst(
@@ -160,7 +184,8 @@ export function buildRacks(
   let bi = 0;
   frames.forEach((f, idx) => {
     const n = framePanels[idx];
-    const panelH = f.height / n;
+    const top = frameTops[idx];
+    const panelH = top / n;
     const clearDepth = f.depth - RACK.POST;
     const cx = f.x + RACK.POST / 2;
     const cz = f.y + f.depth / 2;
@@ -171,7 +196,7 @@ export function buildRacks(
       setBox(braces, bi++, cx, yBottom + RACK.BRACE / 2, cz, RACK.BRACE, RACK.BRACE, clearDepth);
       setBox(braces, bi++, cx, yBottom + panelH / 2, cz, RACK.BRACE, diagLen, RACK.BRACE, (p % 2 === 0 ? 1 : -1) * diagTilt);
     }
-    setBox(braces, bi++, cx, f.height - RACK.BRACE / 2, cz, RACK.BRACE, RACK.BRACE, clearDepth);
+    setBox(braces, bi++, cx, top - RACK.BRACE / 2, cz, RACK.BRACE, RACK.BRACE, clearDepth);
   });
 
   // Beam pairs: one front + one back beam at the TOP of every LEVEL segment.
@@ -184,6 +209,9 @@ export function buildRacks(
   );
   let bmi = 0;
   for (const lv of levels) {
+    // Skip the upper beam of the topmost level in each stack — that level is
+    // open from the top, with no beam above it.
+    if (lv.coordinateZ === topZByFootprint.get(`${lv.coordinateX}|${lv.coordinateY}`)) continue;
     const xC = lv.coordinateX + lv.dimensionX / 2;
     const yC = lv.coordinateZ + lv.dimensionZ + RACK.BEAM_H / 2;
     for (const zC of [lv.coordinateY + RACK.BEAM_D / 2, lv.coordinateY + lv.dimensionY - RACK.BEAM_D / 2]) {
@@ -191,6 +219,7 @@ export function buildRacks(
       setBox(beams, bmi++, xC, yC, zC, lv.dimensionX, RACK.BEAM_H + 2, RACK.BEAM_D);
     }
   }
+  beams.count = bmi; // we skipped the top-level beams, so trim the instance count
 
   // Base plates under every post.
   const plates = makeInst(

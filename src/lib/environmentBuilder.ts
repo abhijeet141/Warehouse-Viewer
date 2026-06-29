@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Segment } from '../types';
 import type { RackRow } from './rackBuilder';
+import { mulberry32 } from './rng';
 
 export const ENV = {
   MARGIN_END: 40000,    // clear floor at the aisle-entrance ends (X) — sets building length
@@ -49,6 +50,73 @@ function makeCladdingTexture(repeats: number): THREE.CanvasTexture {
   return tex;
 }
 
+// Polished-concrete floor: a smooth grey base with soft tonal blotches, fine
+// speckle and faint polish streaks (colour map), plus a varying-gloss roughness
+// map so some patches catch the light more — which, with the env map, gives the
+// wet, reflective sheen of a real warehouse slab. No grid/tile lines.
+function makeFloorTextures(): { map: THREE.CanvasTexture; rough: THREE.CanvasTexture } {
+  const S = 512;
+  const rnd = mulberry32(717);
+
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const ctx = c.getContext('2d')!;
+  ctx.fillStyle = '#938b7a'; // warm beige-grey concrete (matches the reference photo)
+  ctx.fillRect(0, 0, S, S);
+  // large soft tonal blotches — the cloudy troweled/stained unevenness
+  for (let i = 0; i < 56; i++) {
+    const x = rnd() * S, y = rnd() * S, r = 50 + rnd() * 160;
+    const lighter = rnd() > 0.5;
+    const shade = lighter ? '208,201,186' : '146,138,122';
+    const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${shade},${0.06 + rnd() * 0.11})`);
+    g.addColorStop(1, `rgba(${shade},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // fine aggregate speckle
+  for (let i = 0; i < 5000; i++) {
+    const a = 0.03 + rnd() * 0.06;
+    ctx.fillStyle = rnd() > 0.5 ? `rgba(255,255,255,${a})` : `rgba(55,55,52,${a})`;
+    ctx.fillRect(rnd() * S, rnd() * S, 1, 1);
+  }
+  // faint directional polish streaks
+  for (let i = 0; i < 26; i++) {
+    ctx.fillStyle = `rgba(214,207,192,${0.015 + rnd() * 0.025})`;
+    ctx.fillRect(0, rnd() * S, S, 1);
+  }
+  const map = new THREE.CanvasTexture(c);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.wrapS = map.wrapT = THREE.RepeatWrapping;
+  map.anisotropy = 8;
+
+  // Roughness: mid-grey base (≈0.7 reflectivity) with glossier patches, so the
+  // sheen pools unevenly the way a polished slab does.
+  const rc = document.createElement('canvas');
+  rc.width = rc.height = S;
+  const rx = rc.getContext('2d')!;
+  rx.fillStyle = '#b4b4b4';
+  rx.fillRect(0, 0, S, S);
+  for (let i = 0; i < 44; i++) {
+    const x = rnd() * S, y = rnd() * S, r = 60 + rnd() * 170;
+    const v = 120 + Math.floor(rnd() * 110); // darker = glossier patch
+    const g = rx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, `rgba(${v},${v},${v},0.5)`);
+    g.addColorStop(1, `rgba(${v},${v},${v},0)`);
+    rx.fillStyle = g;
+    rx.beginPath();
+    rx.arc(x, y, r, 0, Math.PI * 2);
+    rx.fill();
+  }
+  const rough = new THREE.CanvasTexture(rc);
+  rough.wrapS = rough.wrapT = THREE.RepeatWrapping;
+  rough.anisotropy = 8;
+
+  return { map, rough };
+}
+
 // Concrete slab, portal-frame building shell (inward-facing cladding walls,
 // steel columns, roof rafters, flat deck), aisle markings and high-bay
 // lights, all sized from the segment data bounding box. Walls/ceiling face
@@ -64,7 +132,8 @@ export interface ShellBounds {
 export function buildEnvironment(
   segments: Segment[],
   rows: RackRow[],
-): { group: THREE.Group; shell: ShellBounds; dispose: () => void } {
+  env: THREE.Texture | null = null,
+): { group: THREE.Group; shell: ShellBounds; roof: THREE.Mesh; dispose: () => void } {
   const group = new THREE.Group();
   group.name = 'ENVIRONMENT';
   const disposables: { dispose(): void }[] = [];
@@ -92,10 +161,21 @@ export function buildEnvironment(
 
   const noRaycast = (m: THREE.Object3D) => { m.raycast = () => {}; };
 
-  // Concrete slab.
+  // Polished concrete slab — smooth, continuous, lightly reflective (no grid).
+  const floorTex = makeFloorTextures();
+  floorTex.map.repeat.set(Math.max(1, spanX / 26000), Math.max(1, spanZ / 26000));
+  floorTex.rough.repeat.copy(floorTex.map.repeat);
+  disposables.push(floorTex.map, floorTex.rough);
   const floorGeom = new THREE.PlaneGeometry(spanX, spanZ);
   floorGeom.rotateX(-Math.PI / 2);
-  const floorMat = new THREE.MeshStandardMaterial({ color: ENV_COLORS.floor, roughness: 0.88, metalness: 0 });
+  const floorMat = new THREE.MeshStandardMaterial({
+    map: floorTex.map,
+    roughnessMap: floorTex.rough,
+    roughness: 0.66,       // mostly matte concrete; the map adds glossier patches
+    metalness: 0,
+    envMap: env,
+    envMapIntensity: 0.3,  // gentle sheen only, so the grey concrete colour reads
+  });
   disposables.push(floorGeom, floorMat);
   const floor = new THREE.Mesh(floorGeom, floorMat);
   floor.position.set(centerX, 0, centerZ);
@@ -103,6 +183,8 @@ export function buildEnvironment(
   group.add(floor);
 
   // Cladding walls: front-side planes facing inward — culled from outside.
+  // Grouped under one node so the roof toggle can hide all four walls for a
+  // clean, open overview from any angle.
   const RIB_PITCH = 8000; // one texture tile (8 ribs) per 8m of wall
   const walls: Array<{ len: number; x: number; z: number; rotY: number }> = [
     { len: spanX, x: centerX, z: minZ, rotY: 0 },
@@ -110,6 +192,8 @@ export function buildEnvironment(
     { len: spanZ, x: minX, z: centerZ, rotY: Math.PI / 2 },
     { len: spanZ, x: maxX, z: centerZ, rotY: -Math.PI / 2 },
   ];
+  const wallGroup = new THREE.Group();
+  wallGroup.name = 'SHELL_WALLS';
   for (const w of walls) {
     const geom = new THREE.PlaneGeometry(w.len, eaveH);
     const tex = makeCladdingTexture(w.len / RIB_PITCH);
@@ -119,8 +203,9 @@ export function buildEnvironment(
     mesh.position.set(w.x, eaveH / 2, w.z);
     mesh.rotation.y = w.rotY;
     noRaycast(mesh);
-    group.add(mesh);
+    wallGroup.add(mesh);
   }
+  group.add(wallGroup);
 
   // Roof deck: faces down, culled from above.
   const ceilGeom = new THREE.PlaneGeometry(spanX, spanZ);
@@ -128,6 +213,7 @@ export function buildEnvironment(
   const ceilMat = new THREE.MeshStandardMaterial({ color: ENV_COLORS.ceiling, roughness: 1, metalness: 0 });
   disposables.push(ceilGeom, ceilMat);
   const ceiling = new THREE.Mesh(ceilGeom, ceilMat);
+  ceiling.name = 'ROOF_DECK';
   ceiling.position.set(centerX, eaveH, centerZ);
   noRaycast(ceiling);
   group.add(ceiling);
@@ -160,25 +246,37 @@ export function buildEnvironment(
   const inset = ENV.COLUMN / 2 + 20;
   const columnCount = gridX.length * 2 + Math.max(0, gridZ.length - 2) * 2;
   const rafterCount = gridX.length;
-  const steel = new THREE.InstancedMesh(unitBox, steelMat, columnCount + rafterCount);
-  steel.name = 'SHELL_STEEL';
-  noRaycast(steel);
-  let si = 0;
+  // Vertical perimeter columns are their own mesh so they can stay standing when
+  // the roof is hidden; only the overhead rafters drop away for the top view.
+  const columns = new THREE.InstancedMesh(unitBox, steelMat, columnCount);
+  columns.name = 'SHELL_COLUMNS';
+  noRaycast(columns);
+  let ci = 0;
   for (const x of gridX) {
-    setBox(steel, si++, x, eaveH / 2, minZ + inset, ENV.COLUMN, eaveH, ENV.COLUMN);
-    setBox(steel, si++, x, eaveH / 2, maxZ - inset, ENV.COLUMN, eaveH, ENV.COLUMN);
+    setBox(columns, ci++, x, eaveH / 2, minZ + inset, ENV.COLUMN, eaveH, ENV.COLUMN);
+    setBox(columns, ci++, x, eaveH / 2, maxZ - inset, ENV.COLUMN, eaveH, ENV.COLUMN);
   }
   for (const z of gridZ.slice(1, -1)) {
-    setBox(steel, si++, minX + inset, eaveH / 2, z, ENV.COLUMN, eaveH, ENV.COLUMN);
-    setBox(steel, si++, maxX - inset, eaveH / 2, z, ENV.COLUMN, eaveH, ENV.COLUMN);
+    setBox(columns, ci++, minX + inset, eaveH / 2, z, ENV.COLUMN, eaveH, ENV.COLUMN);
+    setBox(columns, ci++, maxX - inset, eaveH / 2, z, ENV.COLUMN, eaveH, ENV.COLUMN);
   }
+  columns.count = ci;
+  columns.instanceMatrix.needsUpdate = true;
+  columns.computeBoundingSphere();
+  group.add(columns);
+
+  // Overhead rafters: spanning beams at eave level, part of the roof structure.
+  const rafters = new THREE.InstancedMesh(unitBox, steelMat, rafterCount);
+  rafters.name = 'SHELL_RAFTERS';
+  noRaycast(rafters);
+  let ri = 0;
   for (const x of gridX) {
-    setBox(steel, si++, x, eaveH - ENV.RAFTER.h / 2, centerZ, ENV.RAFTER.w, ENV.RAFTER.h, spanZ);
+    setBox(rafters, ri++, x, eaveH - ENV.RAFTER.h / 2, centerZ, ENV.RAFTER.w, ENV.RAFTER.h, spanZ);
   }
-  steel.count = si;
-  steel.instanceMatrix.needsUpdate = true;
-  steel.computeBoundingSphere();
-  group.add(steel);
+  rafters.count = ri;
+  rafters.instanceMatrix.needsUpdate = true;
+  rafters.computeBoundingSphere();
+  group.add(rafters);
 
   // Yellow line along each rack row's aisle-facing edge. Which edge faces the
   // aisle is decided against the aisle volume's centerline.
@@ -261,6 +359,7 @@ export function buildEnvironment(
   return {
     group,
     shell: { minX, maxX, minZ, maxZ, eaveH },
+    roof: ceiling,
     dispose: () => disposables.forEach((d) => d.dispose()),
   };
 }

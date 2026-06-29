@@ -25,6 +25,12 @@ export interface RailControlsOptions {
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
+// Keys that count as a manual takeover (movement, look, vertical, aisle switch).
+const NAV_CODES = new Set([
+  'KeyW', 'ArrowUp', 'KeyS', 'ArrowDown', 'KeyA', 'KeyD',
+  'KeyE', 'PageUp', 'KeyQ', 'PageDown', 'ArrowLeft', 'ArrowRight',
+]);
+
 /**
  * Rail navigation: camera X/Z is locked to an aisle centerline (so it can never
  * enter a rack), while orientation is free (drag to look, A/D to turn) and the
@@ -40,12 +46,21 @@ export class RailControls {
   // Fires whenever the active aisle changes, so Svelte UI can update.
   onChange: ((info: { index: number; name: string; total: number }) => void) | null = null;
 
+  // When true, update() ignores keyboard/pointer movement so an external driver
+  // (the virtual tour autopilot) can script dist/yaw/pitch/height via setPose();
+  // the camera is still rendered from that state each frame.
+  autopilot = false;
+
+  // Fires on any manual movement / look / aisle-switch input while enabled, so
+  // the tour can hand control back to the user (it stops itself on first input).
+  onUserInput: (() => void) | null = null;
+
   private dist = 0;    // distance traveled along the current aisle
   private height = 0;  // current camera Y
   private yaw = 0;     // around world Y
   private pitch = 0;   // around local X
   private opts: Required<Omit<RailControlsOptions, 'maxHeight'>> & { maxHeight: number };
-  private keys = { fwd: false, back: false, left: false, right: false, up: false, down: false };
+  private keys = { fwd: false, back: false, left: false, right: false, up: false, down: false, strafeL: false, strafeR: false };
   private dragging = false;
   private lastX = 0;
   private lastY = 0;
@@ -139,7 +154,7 @@ export class RailControls {
     window.removeEventListener('pointerup', this.onPointerUp);
     this.dom.removeEventListener('wheel', this.onWheel);
     this.dom.style.cursor = '';
-    this.keys = { fwd: false, back: false, left: false, right: false, up: false, down: false };
+    this.keys = { fwd: false, back: false, left: false, right: false, up: false, down: false, strafeL: false, strafeR: false };
     this.dragging = false;
   }
 
@@ -149,6 +164,12 @@ export class RailControls {
 
   get aisleNames(): string[] {
     return this.aisles.map((a) => a.name);
+  }
+
+  // Current distance along the active aisle's centreline, so the tour can pick
+  // up from exactly where the user is standing rather than the aisle's start.
+  get currentDist(): number {
+    return this.dist;
   }
 
   setAisle(index: number, faceForward = true) {
@@ -172,14 +193,57 @@ export class RailControls {
     this.setAisle(this.index - 1);
   }
 
+  // Programmatic drive for the autopilot. dist is clamped to the active aisle;
+  // height to its travel limits. Only provided fields change.
+  setPose(p: { dist?: number; yaw?: number; pitch?: number; height?: number }) {
+    const a = this.aisles[this.index];
+    if (p.dist !== undefined && a) this.dist = clamp(p.dist, 0, a.length);
+    if (p.yaw !== undefined) this.yaw = p.yaw;
+    if (p.pitch !== undefined) this.pitch = p.pitch;
+    if (p.height !== undefined) {
+      this.height = clamp(p.height, this.opts.minHeight, this.opts.maxHeight);
+    }
+  }
+
+  seek(dist: number) {
+    this.setPose({ dist });
+  }
+
+  // Adopt the camera's current world pose into the rail's own state (active aisle,
+  // distance along it, yaw/pitch, eye height). Used when the virtual tour hands
+  // control back: the camera may be mid-turn between aisles where the rail's
+  // stored state is stale, so re-derive it from where the camera actually is/looks
+  // to avoid snapping or flipping the view.
+  syncFromCamera() {
+    if (this.aisles.length === 0) return;
+    this.index = this.nearestAisle();
+    const a = this.aisles[this.index];
+    const rel = this.camera.position.clone().sub(a.start);
+    this.dist = clamp(rel.dot(a.dir), 0, a.length);
+    this.height = this.camera.position.y;
+    const e = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ');
+    this.yaw = e.y;
+    this.pitch = e.x;
+    this.onChange?.({ index: this.index, name: a.name, total: this.aisles.length });
+  }
+
+  // The aisle the camera is actually standing in: the one whose centreline runs
+  // closest to it, measured to the NEAREST POINT on the segment (not the midpoint).
+  // Using the midpoint mis-fires when aisles differ in length/offset — walking far
+  // along a long aisle could land nearer a neighbour's midpoint and snap the camera
+  // sideways into that aisle on pause/stop. Distance to the closest point on the
+  // centreline is ~0 for the aisle you're in (you're on its line) and at least the
+  // lateral gap for any parallel aisle, so the right one always wins. (Height is a
+  // shared constant across all centrelines, so it doesn't affect the argmin.)
   private nearestAisle(): number {
     const p = this.camera.position;
     let best = 0;
     let bestD = Infinity;
     for (let i = 0; i < this.aisles.length; i++) {
       const a = this.aisles[i];
-      const mid = a.start.clone().addScaledVector(a.dir, a.length / 2);
-      const d = mid.distanceToSquared(p);
+      const t = clamp(p.clone().sub(a.start).dot(a.dir), 0, a.length);
+      const closest = a.start.clone().addScaledVector(a.dir, t);
+      const d = closest.distanceToSquared(p);
       if (d < bestD) {
         bestD = d;
         best = i;
@@ -191,13 +255,19 @@ export class RailControls {
   private onKeyDown(e: KeyboardEvent) {
     const t = e.target as HTMLElement | null;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+    // Any recognised navigation key is a manual takeover — let the tour bail out.
+    if (NAV_CODES.has(e.code)) this.onUserInput?.();
     switch (e.code) {
       case 'KeyW':
       case 'ArrowUp':
+        // Facing a rack, "forward" crosses through it to that side's aisle (one
+        // hop per press); facing down the aisle, it glides along the rail as usual.
+        if (this.facingAcrossAisle()) { if (!e.repeat) this.stepAcrossToward(true); break; }
         this.keys.fwd = true;
         break;
       case 'KeyS':
       case 'ArrowDown':
+        if (this.facingAcrossAisle()) { if (!e.repeat) this.stepAcrossToward(false); break; }
         this.keys.back = true;
         break;
       case 'KeyA':
@@ -215,10 +285,14 @@ export class RailControls {
         this.keys.down = true;
         break;
       case 'ArrowLeft':
-        this.prevAisle();
+        // Turned toward a rack, screen-left runs along the aisle → strafe the
+        // camera down the rail; facing down the aisle, hop to the prev aisle.
+        if (this.facingAcrossAisle()) this.keys.strafeL = true;
+        else this.prevAisle();
         break;
       case 'ArrowRight':
-        this.nextAisle();
+        if (this.facingAcrossAisle()) this.keys.strafeR = true;
+        else this.nextAisle();
         break;
       default:
         return;
@@ -252,10 +326,62 @@ export class RailControls {
       case 'PageDown':
         this.keys.down = false;
         break;
+      case 'ArrowLeft':
+        this.keys.strafeL = false;
+        break;
+      case 'ArrowRight':
+        this.keys.strafeR = false;
+        break;
     }
   }
 
+  // True when the view is turned far enough across the aisle (looking at a rack)
+  // that screen left/right runs ALONG the aisle. Past ~45° off the centreline the
+  // arrows strafe the camera down the rail instead of switching aisles.
+  private facingAcrossAisle(): boolean {
+    const a = this.aisles[this.index];
+    if (!a) return false;
+    const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    return Math.abs(right.dot(a.dir)) > 0.5;
+  }
+
+  // While looking at a rack, hop to the neighbouring aisle the view points at —
+  // i.e. "through" the rack you're facing (forward) or the one behind you (back).
+  // Picks whichever adjacent aisle best lines up with the look direction across
+  // the rail, and does nothing at the row's edge where there's no aisle that way.
+  private stepAcrossToward(forward: boolean) {
+    const a = this.aisles[this.index];
+    if (!a) return;
+    const look = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    look.y = 0;
+    if (!forward) look.negate();
+    if (look.lengthSq() < 1e-6) return;
+    look.normalize();
+    const here = a.start.clone().addScaledVector(a.dir, a.length / 2);
+    let step = 0;
+    let bestDot = 0.3; // require a fairly clear match so a glance doesn't jump aisles
+    for (const s of [-1, 1]) {
+      const b = this.aisles[this.index + s];
+      if (!b) continue;
+      const toB = b.start.clone().addScaledVector(b.dir, b.length / 2).sub(here);
+      toB.y = 0;
+      if (toB.lengthSq() < 1e-6) continue;
+      const d = look.dot(toB.normalize());
+      if (d > bestDot) { bestDot = d; step = s; }
+    }
+    if (step === 0) return;
+    const target = this.index + step;
+    const b = this.aisles[target];
+    // Keep our spot along the rail and our gaze on the racks (faceForward = false),
+    // so it reads as stepping straight across to the rack in front — not restarting
+    // the neighbouring aisle from its mouth.
+    const keepDist = clamp(this.camera.position.clone().sub(b.start).dot(b.dir), 0, b.length);
+    this.setAisle(target, false);
+    this.dist = keepDist;
+  }
+
   private onPointerDown(e: PointerEvent) {
+    this.onUserInput?.(); // grabbing the view takes over from the tour
     this.dragging = true;
     this.lastX = e.clientX;
     this.lastY = e.clientY;
@@ -297,30 +423,48 @@ export class RailControls {
     if (!this.enabled || this.aisles.length === 0) return;
     const a = this.aisles[this.index];
 
-    if (this.keys.left) this.yaw += this.opts.keyYawSpeed * dt;
-    if (this.keys.right) this.yaw -= this.opts.keyYawSpeed * dt;
+    // Manual input is skipped under autopilot; the tour scripts dist/yaw/pitch
+    // via setPose() and we still render from that state below.
+    if (!this.autopilot) {
+      if (this.keys.left) this.yaw += this.opts.keyYawSpeed * dt;
+      if (this.keys.right) this.yaw -= this.opts.keyYawSpeed * dt;
 
-    // Forward / back glides along the rail, in whichever direction we face.
-    let move = 0;
-    if (this.keys.fwd) move += 1;
-    if (this.keys.back) move -= 1;
-    if (move !== 0) {
-      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
-      const along = forward.dot(a.dir);
-      const sign = Math.abs(along) < 0.1 ? 1 : Math.sign(along);
-      this.dist = clamp(this.dist + move * sign * this.opts.moveSpeed * dt, 0, a.length);
-    }
+      // Forward / back glides along the rail, in whichever direction we face.
+      let move = 0;
+      if (this.keys.fwd) move += 1;
+      if (this.keys.back) move -= 1;
+      if (move !== 0) {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camera.quaternion);
+        const along = forward.dot(a.dir);
+        const sign = Math.abs(along) < 0.1 ? 1 : Math.sign(along);
+        this.dist = clamp(this.dist + move * sign * this.opts.moveSpeed * dt, 0, a.length);
+      }
 
-    // Up / down rides straight up the aisle to inspect higher levels.
-    let lift = 0;
-    if (this.keys.up) lift += 1;
-    if (this.keys.down) lift -= 1;
-    if (lift !== 0) {
-      this.height = clamp(
-        this.height + lift * this.opts.verticalSpeed * dt,
-        this.opts.minHeight,
-        this.opts.maxHeight,
-      );
+      // Strafe: when the view is turned toward a rack, ←/→ walk the camera ALONG
+      // the aisle (screen-left / screen-right project onto the rail) rather than
+      // switching aisles — so the keys match where you're actually looking.
+      let strafe = 0;
+      if (this.keys.strafeR) strafe += 1;
+      if (this.keys.strafeL) strafe -= 1;
+      if (strafe !== 0) {
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+        const along = right.dot(a.dir);
+        if (Math.abs(along) > 1e-3) {
+          this.dist = clamp(this.dist + strafe * Math.sign(along) * this.opts.moveSpeed * dt, 0, a.length);
+        }
+      }
+
+      // Up / down rides straight up the aisle to inspect higher levels.
+      let lift = 0;
+      if (this.keys.up) lift += 1;
+      if (this.keys.down) lift -= 1;
+      if (lift !== 0) {
+        this.height = clamp(
+          this.height + lift * this.opts.verticalSpeed * dt,
+          this.opts.minHeight,
+          this.opts.maxHeight,
+        );
+      }
     }
 
     const pos = a.start.clone().addScaledVector(a.dir, this.dist);
