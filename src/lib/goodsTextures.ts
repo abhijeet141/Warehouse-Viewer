@@ -62,9 +62,10 @@ function heightToNormal(height: HTMLCanvasElement, strength = 2): THREE.CanvasTe
 }
 
 // ---- cardboard (kraft) -----------------------------------------------------
-// Warm kraft box with paper mottle, a translucent packing-tape seam and a small
-// shipping label (barcode + colour flash). Tape and label stand proud in the
-// normal map so they catch the light.
+// Warm kraft box with paper mottle and a translucent packing-tape seam (the tape
+// stands proud in the normal map so it catches the light). No printed shipping
+// label here — the single real FloWMS label is placed on the load's front face by
+// the goods builder, so a baked-in label would just repeat on every box face.
 export function cardboardTexture(): THREE.CanvasTexture {
   return cached('cardboard', () => {
     const [c, ctx] = makeCanvas(256, 256);
@@ -96,15 +97,6 @@ export function cardboardTexture(): THREE.CanvasTexture {
     ctx.fillRect(112, 0, 2, 256);
     ctx.fillRect(142, 0, 2, 256);
 
-    // shipping label
-    ctx.fillStyle = '#f5f3ec';
-    ctx.fillRect(26, 150, 70, 48);
-    ctx.fillStyle = '#3f5d8a';
-    ctx.fillRect(26, 150, 70, 9); // colour header bar
-    ctx.fillStyle = '#2b2b2b';
-    for (let i = 0; i < 16; i++) ctx.fillRect(30 + i * 4, 164, 1 + (rnd() > 0.5 ? 1 : 0), 16); // barcode
-    for (let i = 0; i < 3; i++) ctx.fillRect(30, 184 + i * 4, 50 - i * 10, 2);
-
     const t = new THREE.CanvasTexture(c);
     t.colorSpace = THREE.SRGBColorSpace;
     t.anisotropy = 4;
@@ -130,13 +122,6 @@ export function cardboardNormal(): THREE.CanvasTexture {
     ctx.fillStyle = '#cfcfcf';
     ctx.fillRect(112, 0, 3, 256);
     ctx.fillRect(141, 0, 3, 256);
-    // raised label
-    ctx.fillStyle = '#a8a8a8';
-    ctx.fillRect(26, 150, 70, 48);
-    ctx.fillStyle = '#d8d8d8';
-    ctx.strokeStyle = '#d8d8d8';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(26, 150, 70, 48);
     const t = heightToNormal(c, 2.2);
     t.anisotropy = 4;
     return t;
