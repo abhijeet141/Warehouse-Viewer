@@ -41,6 +41,13 @@
   let navCollapsed = false;
   function toggleNav() { navCollapsed = !navCollapsed; }
 
+  // Small-screen (mobile/tablet) hamburger menu. On desktop the controls sit
+  // inline in the header and this state is ignored (the panel uses display:contents
+  // via CSS); below the responsive breakpoint the controls collapse into a dropdown
+  // that this toggles open. Has no effect on the desktop/laptop layout.
+  let menuOpen = false;
+  function toggleMenu() { menuOpen = !menuOpen; }
+
   // Fade out the inline loading overlay (in index.html) once the 3D scene has
   // rendered its first frame — this masks the whole startup so there's no flash.
   // Kept on screen for at least MIN_LOADER_MS so it never just flickers past.
@@ -171,6 +178,26 @@
       </span>
     </div>
 
+    <!-- Mobile/tablet hamburger — hidden on desktop via CSS (display:none). Toggles
+         the .nav-body dropdown below the responsive breakpoint. -->
+    <button
+      class="hamburger"
+      class:open={menuOpen}
+      on:click={toggleMenu}
+      title={menuOpen ? 'Close menu' : 'Open menu'}
+      aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+      aria-expanded={menuOpen}
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        {#if menuOpen}
+          <path d="M6 6l12 12M18 6L6 18" />
+        {:else}
+          <path d="M4 7h16M4 12h16M4 17h16" />
+        {/if}
+      </svg>
+    </button>
+
+    <div class="nav-body" class:open={menuOpen}>
     <div class="search">
       <div class="search-bar">
         <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
@@ -303,6 +330,7 @@
         </svg>
       </button>
     </div>
+    </div>
   </header>
 
   {#if navCollapsed}
@@ -391,6 +419,29 @@
   }
   .nav-reveal:hover { color: #1d4ed8; background: #ffffff; height: 27px; }
   .nav-reveal svg { width: 18px; height: 18px; }
+  /* On desktop the wrapper is layout-invisible: its children (search, overlays,
+     toolbar) behave exactly as direct header flex items, so the desktop layout is
+     unchanged. The responsive media query below turns it into a dropdown panel. */
+  .nav-body { display: contents; }
+
+  /* Hamburger — desktop hidden; revealed only at the responsive breakpoint. */
+  .hamburger {
+    display: none;
+    flex: none;
+    margin-left: auto;
+    width: 36px; height: 36px;
+    place-items: center;
+    background: transparent;
+    border: 1.5px solid #cbd5e1;
+    border-radius: 10px;
+    color: #475569;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .hamburger:hover { border-color: #3b82f6; color: #3b82f6; }
+  .hamburger.open { border-color: #3b82f6; color: #3b82f6; background: rgba(59,130,246,0.08); }
+  .hamburger svg { width: 20px; height: 20px; }
+
   .title { display: flex; flex-direction: column; flex: none; }
   h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: 0.2px; }
   .subtitle { font-size: 11px; opacity: 0.6; margin-top: 2px; letter-spacing: 0.2px; }
@@ -567,4 +618,56 @@
   }
   .icon-btn:hover { border-color: #3b82f6; color: #3b82f6; }
   .icon-btn svg { width: 16px; height: 16px; }
+
+  /* ──────────────────────────────────────────────────────────────────────────
+     Responsive: mobile & tablet (≤ 1024px). Everything here is scoped to this
+     media query, so the desktop/laptop layout above is completely untouched.
+     The inline controls collapse into a hamburger-toggled dropdown panel.
+     ────────────────────────────────────────────────────────────────────────── */
+  @media (max-width: 1024px) {
+    /* Header stays a single compact row: title on the left, hamburger on the right.
+       Don't scale the header down on small screens — it cramps touch targets. */
+    main { --nav-scale: 1; }
+    header { gap: 10px; padding: 0 14px; }
+
+    .hamburger { display: grid; }
+
+    /* The controls move into a right-aligned dropdown that overlays the scene.
+       Hidden until the hamburger opens it. */
+    .nav-body {
+      display: none;
+      position: absolute;
+      top: calc(var(--nav-h) + 6px);
+      right: 10px;
+      left: 10px;
+      max-width: 380px;
+      margin-left: auto;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 14px;
+      padding: 16px;
+      box-sizing: border-box;
+      background: #f4f6f8;
+      border: 1px solid #cbd5e1;
+      border-radius: 14px;
+      box-shadow: 0 18px 40px rgba(15, 23, 42, 0.22);
+      max-height: calc(100vh - var(--nav-h) - 24px);
+      overflow-y: auto;
+    }
+    .nav-body.open { display: flex; }
+
+    /* Each control group stacks full-width inside the panel. */
+    .nav-body .search { flex: none; width: 100%; min-width: 0; }
+    .nav-body .filters,
+    .nav-body .toolbar {
+      margin-left: 0;
+      flex-wrap: wrap;
+      width: 100%;
+      gap: 10px 8px;
+    }
+    /* Vertical dividers don't make sense once the toolbar wraps. */
+    .nav-body .divider { display: none; }
+    /* Let the inner groups wrap rather than overflow the panel. */
+    .nav-body .toolbar .group { flex-wrap: wrap; }
+  }
 </style>
